@@ -77,7 +77,7 @@ Validate that all [[parser#Wiki Links]] in `lat.md` markdown files point to exis
 
 Two validations:
 
-1. Every `// @lat: [[...]]` or `# @lat: [[...]]` comment in source code must point to a real section in `lat.md/`
+1. Every `// @lat: [[...]]`, `# @lat: [[...]]`, or `-- @lat: [[...]]` (SQL) comment in source code must point to a real section in `lat.md/`
 2. For files with [[markdown#Frontmatter#require-code-mention]], every leaf section must be referenced by at least one `// @lat:` comment in the codebase
 
 ### sections

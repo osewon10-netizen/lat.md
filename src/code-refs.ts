@@ -37,9 +37,10 @@ function re(flags: string) {
     new RegExp(strings.raw[0].replace(/\s+/g, ''), flags);
 }
 
-// Line comment (// or #), then @lat: marker, then [[target]]
+// Line comment (//, #, or --), then @lat: marker, then [[target]].
+// `--` covers SQL; the other two cover C-family + Python/shell.
 export const LAT_REF_RE = re('gv')`
-  (?: // | # )
+  (?: // | -- | # )
   \s* @lat: \s*
   \[\[
     ( [^\]]+ )

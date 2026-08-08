@@ -390,6 +390,34 @@ describe('python-code-ref', () => {
   });
 });
 
+// --- sql-code-ref ---
+
+describe('sql-code-ref', () => {
+  it('scans @lat refs from SQL -- comments', async () => {
+    const { refs } = await scanCodeRefs(caseDir('sql-code-ref'));
+    expect(refs).toHaveLength(3);
+
+    expect(refs[0].target).toBe('Specs#Feature A');
+    expect(refs[0].file).toContain('queries.sql');
+    expect(refs[0].line).toBe(1);
+
+    expect(refs[1].target).toBe('Specs#Feature B');
+    expect(refs[1].file).toContain('queries.sql');
+    expect(refs[1].line).toBe(5);
+
+    expect(refs[2].target).toBe('Specs#Nonexistent');
+    expect(refs[2].line).toBe(8);
+  });
+
+  it('detects dangling @lat ref in SQL file', async () => {
+    const { errors, files } = await checkCodeRefs(latDir('sql-code-ref'));
+    expect(errors).toHaveLength(1);
+    expect(errors[0].target).toBe('Specs#Nonexistent');
+    expect(errors[0].message).toContain('no matching section found');
+    expect(files).toEqual({ '.sql': 1 });
+  });
+});
+
 // --- gitignore-filtering ---
 
 describe('gitignore-filtering', () => {
