@@ -105,12 +105,10 @@ async function handleUserPromptSubmit(): Promise<void> {
   const parts: string[] = [];
 
   parts.push(
-    "Before starting work, run `lat search` with one or more queries describing the user's intent.",
-    'ALWAYS do this, even when the task seems straightforward — search results may reveal critical design details, protocols, or constraints.',
-    'Use `lat section` to read the full content of relevant matches.',
-    'Do not read files, write code, or run commands until you have searched.',
+    'If this prompt starts NEW work in this repo (implementing, debugging, reviewing, or planning a change), orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — the graph holds design law the code cannot show.',
+    'Skip the search for conversational follow-ups, questions about content already in context, and non-repo tasks — searching there is noise, not diligence.',
     '',
-    'Remember: `lat.md/` must stay in sync with the codebase. If you change code, update the relevant sections in `lat.md/` and run `lat check` before finishing.',
+    'Remember: `lat.md/` must stay in sync with the codebase. If you change code or behavior, update the relevant `lat.md/` sections and run `lat check` before finishing.',
   );
 
   const latDir = findLatticeDir();
