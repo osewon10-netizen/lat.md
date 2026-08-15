@@ -11,11 +11,11 @@ import { getSection, formatSectionOutput } from './section.js';
 import { checkMd, checkCodeRefs, checkIndex, checkSections } from './check.js';
 import { SOURCE_EXTENSIONS } from '../source-parser.js';
 
-function outputClaudePromptSubmit(context: string): void {
+function outputClaudeContext(hookEventName: string, context: string): void {
   process.stdout.write(
     JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: 'UserPromptSubmit',
+        hookEventName,
         additionalContext: context,
       },
     }),
@@ -63,6 +63,7 @@ function makeHookCtx(latDir: string): CmdContext {
 async function searchAndExpand(
   ctx: CmdContext,
   userPrompt: string,
+  label = 'the user prompt',
 ): Promise<string | null> {
   let result;
   try {
@@ -80,7 +81,7 @@ async function searchAndExpand(
   if (result.matches.length === 0) return null;
 
   const parts: string[] = [
-    `Search results for the user prompt (${result.matches.length} matches):`,
+    `Search results for ${label} (${result.matches.length} matches):`,
     '',
   ];
 
@@ -159,17 +160,11 @@ async function handleUserPromptSubmit(): Promise<void> {
     // If we can't parse stdin, still emit the reminder
   }
 
+  // Static orientation lives in SessionStart now — this hook emits only
+  // per-prompt dynamic content: resolved [[refs]] and budgeted search matches.
+  void sessionId;
   const parts: string[] = [];
   const latDir = findLatticeDir();
-
-  if (tryFire(sessionId ?? '', latDir ?? '', 'prompt-reminder', 1)) {
-    parts.push(
-      'If this prompt starts NEW work in this repo (implementing, debugging, reviewing, or planning a change), orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — the graph holds design law the code cannot show.',
-      'Skip the search for conversational follow-ups, questions about content already in context, and non-repo tasks — searching there is noise, not diligence.',
-      '',
-      'Remember: `lat.md/` must stay in sync with the codebase. If you change code or behavior, update the relevant `lat.md/` sections and run `lat check` before finishing.',
-    );
-  }
   if (latDir && userPrompt) {
     const ctx = makeHookCtx(latDir);
 
@@ -210,7 +205,50 @@ async function handleUserPromptSubmit(): Promise<void> {
 
   const context = parts.join('\n').replace(/^\n+/, '');
   if (!context) return;
-  outputClaudePromptSubmit(context);
+  outputClaudeContext('UserPromptSubmit', context);
+}
+
+const ORIENTATION_REMINDER = [
+  'This repo keeps its design law in `lat.md/`. When starting work on something new, orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — hooks also inject relevant sections at prompt and claim time.',
+  'Keep `lat.md/` in sync: fold durable invariants after behavior/architecture/test changes and get `lat check` green before the push (the commit and push gates nudge if you forget).',
+].join('\n');
+
+const COMPACT_REANCHOR = [
+  'Context was compacted — re-anchor on repo discipline:',
+  '- The pre-push gate runs INSIDE the commit chain; exit 0 alone proves nothing (test count moved + name-presence).',
+  '- lat.md folds land BEFORE the push; `lat check` green.',
+  '- Job ends at push + status update; deploy/verify belongs to the host node.',
+].join('\n');
+
+/**
+ * SessionStart: the one-time orientation home (fires once by construction on
+ * startup; the counter guards resumes), plus a post-compact re-anchor of the
+ * discipline essentials — compaction eats exactly this kind of context.
+ * Repos without lat.md/ get a silent no-op.
+ */
+async function handleClaudeSessionStart(): Promise<void> {
+  let sessionId = '';
+  let source = '';
+  try {
+    const raw = await readStdin();
+    const input = JSON.parse(raw);
+    if (typeof input.session_id === 'string') sessionId = input.session_id;
+    source = input.source ?? input.matcher_value ?? '';
+  } catch {
+    // Missing/unparseable stdin: treat as a fresh start.
+  }
+
+  const latDir = findLatticeDir();
+  if (!latDir) return;
+
+  if (source === 'compact') {
+    if (!tryFire(sessionId, latDir, 'compact-anchor', MAX_FIRES_PER_SESSION))
+      return;
+    outputClaudeContext('SessionStart', COMPACT_REANCHOR);
+  } else {
+    if (!tryFire(sessionId, latDir, 'session-orient', 1)) return;
+    outputClaudeContext('SessionStart', ORIENTATION_REMINDER);
+  }
 }
 
 /** Minimum diff size (in lines) to consider "significant" code change. */
@@ -650,14 +688,33 @@ async function pushChecks(
  * read or an item claim): inject the lat orientation reminder at the moment an
  * item is actually picked up. Once per session.
  */
+/** Text parts of an MCP tool_response, defensively extracted. */
+function extractToolResponseText(resp: unknown): string {
+  if (!resp) return '';
+  if (typeof resp === 'string') return resp;
+  const content = (resp as { content?: unknown })?.content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => (typeof c?.text === 'string' ? c.text : ''))
+      .join('\n');
+  }
+  try {
+    return JSON.stringify(resp);
+  } catch {
+    return '';
+  }
+}
+
 async function handleClaudePostToolUse(): Promise<void> {
   let sessionId = '';
   let toolName = '';
+  let responseText = '';
   try {
     const raw = await readStdin();
     const input = JSON.parse(raw);
     if (typeof input.session_id === 'string') sessionId = input.session_id;
     toolName = input.tool_name ?? '';
+    responseText = extractToolResponseText(input.tool_response);
   } catch {
     return;
   }
@@ -665,18 +722,41 @@ async function handleClaudePostToolUse(): Promise<void> {
   const latDir = findLatticeDir();
   if (!latDir) return;
 
+  // Claiming is the commitment point: auto-orient on the claimed item's own
+  // text — a far better search query than any user prompt. Falls back to the
+  // static reminder when no index is available.
+  if (/claim_item/.test(toolName) && responseText) {
+    if (!tryFire(sessionId, latDir, 'claim-search', MAX_FIRES_PER_SESSION))
+      return;
+    let searchContext: string | null = null;
+    try {
+      searchContext = await searchAndExpand(
+        makeHookCtx(latDir),
+        responseText.slice(0, 1500),
+        'the claimed item',
+      );
+    } catch {
+      // No usable index — fall through to the static reminder.
+    }
+    if (searchContext) {
+      outputClaudeContext(
+        'PostToolUse',
+        'Item claimed — relevant lat.md context:\n\n' +
+          searchContext +
+          '\n\nGo deeper with `lat section`, and read the spec section the item names before editing.',
+      );
+      return;
+    }
+  }
+
   if (!tryFire(sessionId, latDir, 'work-start', 1)) return;
 
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PostToolUse',
-        additionalContext: [
-          `Work item picked up (${toolName || 'queue tool'}). Before reading source for it: \`lat search\` the item's intent, then \`lat section\` on the relevant hits — the graph holds design law the code cannot show.`,
-          'When the change lands: fold durable invariants into `lat.md/` and get `lat check` green before the push.',
-        ].join('\n'),
-      },
-    }),
+  outputClaudeContext(
+    'PostToolUse',
+    [
+      `Work item picked up (${toolName || 'queue tool'}). Before reading source for it: \`lat search\` the item's intent, then \`lat section\` on the relevant hits — the graph holds design law the code cannot show.`,
+      'When the change lands: fold durable invariants into `lat.md/` and get `lat check` green before the push.',
+    ].join('\n'),
   );
 }
 
@@ -705,9 +785,12 @@ export async function hookCmd(agent: string, event: string): Promise<void> {
         case 'PostToolUse':
           await handleClaudePostToolUse();
           return;
+        case 'SessionStart':
+          await handleClaudeSessionStart();
+          return;
         default:
           console.error(
-            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse`,
+            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse, SessionStart`,
           );
           process.exit(1);
       }

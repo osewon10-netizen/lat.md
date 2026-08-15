@@ -8,21 +8,34 @@ Functional tests for the Stop and UserPromptSubmit hooks. Runs `lat hook claude 
 
 Tests in `tests/hook.test.ts`.
 
-## Reminder emitted once per session
+## Prompt hook is dynamic-only
 
-With a `session_id` on stdin, the static lat.md reminder is emitted on the
-first prompt of the session only; a repeat prompt in the same session gets no
-reminder (a tmpdir marker keyed by session + repo records the first emission).
+With no `[[refs]]` in the prompt and no index matches, UserPromptSubmit emits
+nothing — the static orientation lives in SessionStart, so prompts carry only
+per-prompt content.
 
-## Missing session id reminds every prompt
+## Session orientation fires once at start
 
-Without a `session_id`, the hook fails open and emits the reminder on every
-prompt — the pre-dedup behavior for callers that don't supply one.
+SessionStart with a non-compact source emits the orientation reminder once
+per session; a later resume in the same session is silent.
 
-## Distinct sessions each get one reminder
+## Compact re-anchor fires at most twice
 
-Two different session ids each get their own first-prompt reminder; dedup is
-per session, not global.
+SessionStart with `source: compact` emits the discipline re-anchor, capped at
+two firings per session.
+
+## Non-adopted repos get a silent no-op
+
+SessionStart in a directory with no `lat.md/` anywhere above produces no
+output on stdout or stderr — repos that haven't adopted lat.md need no
+carve-outs.
+
+## Claim auto-search falls back to the reminder
+
+A claim_item response with no usable search index falls back to the static
+work-start reminder; once budgets are spent, further claims are silent. (The
+search-injection path itself needs a live index and is verified live, not in
+fixtures.)
 
 ## Exits silently when check passes and no diff
 

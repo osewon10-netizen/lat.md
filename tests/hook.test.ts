@@ -79,6 +79,8 @@ function runHook(
     sessionId?: string;
     toolName?: string;
     toolCommand?: string;
+    source?: string;
+    toolResponseText?: string;
   } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
   const stdinJson = JSON.stringify({
@@ -88,6 +90,10 @@ function runHook(
     ...(opts.sessionId ? { session_id: opts.sessionId } : {}),
     ...(opts.toolName ? { tool_name: opts.toolName } : {}),
     ...(opts.toolCommand ? { tool_input: { command: opts.toolCommand } } : {}),
+    ...(opts.source ? { source: opts.source } : {}),
+    ...(opts.toolResponseText
+      ? { tool_response: { content: [{ type: 'text', text: opts.toolResponseText }] } }
+      : {}),
   });
 
   const env: Record<string, string> = {
@@ -137,43 +143,64 @@ function uniqueSessionId(): string {
 }
 
 describe('hook prompt submit', () => {
-  // @lat: [[tests/hook#Reminder emitted once per session]]
-  it('emits the static reminder on the first prompt of a session only', () => {
-    const sessionId = uniqueSessionId();
-    const first = runHook('claude', 'UserPromptSubmit', clean, {
+  // @lat: [[tests/hook#Prompt hook is dynamic-only]]
+  it('emits nothing when the prompt has no refs and no index matches', () => {
+    const { stdout } = runHook('claude', 'UserPromptSubmit', clean, {
       userPrompt: 'do a thing',
+      sessionId: uniqueSessionId(),
+    });
+    expect(stdout).toBe('');
+  });
+});
+
+describe('hook session start', () => {
+  // @lat: [[tests/hook#Session orientation fires once at start]]
+  it('emits orientation on startup once per session', () => {
+    const sessionId = uniqueSessionId();
+    const first = runHook('claude', 'SessionStart', clean, {
       sessionId,
+      source: 'startup',
     });
     expect(first.stdout).toContain('lat search');
-    expect(first.stdout).toContain('stay in sync');
+    expect(first.stdout).toContain('lat check');
 
-    const second = runHook('claude', 'UserPromptSubmit', clean, {
-      userPrompt: 'another thing',
+    const second = runHook('claude', 'SessionStart', clean, {
       sessionId,
+      source: 'resume',
     });
-    expect(second.stdout).not.toContain('stay in sync');
+    expect(second.stdout).toBe('');
   });
 
-  // @lat: [[tests/hook#Missing session id reminds every prompt]]
-  it('reminds on every prompt when no session_id is supplied', () => {
+  // @lat: [[tests/hook#Compact re-anchor fires at most twice]]
+  it('re-anchors discipline after compaction, at most twice', () => {
+    const sessionId = uniqueSessionId();
     for (let i = 0; i < 2; i++) {
-      const { stdout } = runHook('claude', 'UserPromptSubmit', clean, {
-        userPrompt: 'do a thing',
+      const { stdout } = runHook('claude', 'SessionStart', clean, {
+        sessionId,
+        source: 'compact',
       });
-      expect(stdout).toContain('stay in sync');
+      expect(stdout).toContain('re-anchor');
     }
+    const third = runHook('claude', 'SessionStart', clean, {
+      sessionId,
+      source: 'compact',
+    });
+    expect(third.stdout).toBe('');
   });
 
-  // @lat: [[tests/hook#Distinct sessions each get one reminder]]
-  it('a second session still gets its own first-prompt reminder', () => {
-    const a = uniqueSessionId();
-    const b = uniqueSessionId();
-    runHook('claude', 'UserPromptSubmit', clean, { userPrompt: 'x', sessionId: a });
-    const { stdout } = runHook('claude', 'UserPromptSubmit', clean, {
-      userPrompt: 'y',
-      sessionId: b,
-    });
-    expect(stdout).toContain('stay in sync');
+  // @lat: [[tests/hook#Non-adopted repos get a silent no-op]]
+  it('is silent in a directory with no lat.md anywhere above', () => {
+    const noLat = mkdtempSync(join(tmpdir(), 'lat-nolat-'));
+    try {
+      const { stdout, stderr } = runHook('claude', 'SessionStart', noLat, {
+        sessionId: uniqueSessionId(),
+        source: 'startup',
+      });
+      expect(stdout).toBe('');
+      expect(stderr).toBe('');
+    } finally {
+      rmDirBestEffort(noLat);
+    }
   });
 });
 
@@ -345,14 +372,33 @@ describe('hook post-tool-use (work-start reminder)', () => {
     const sessionId = uniqueSessionId();
     const first = runHook('claude', 'PostToolUse', clean, {
       sessionId,
-      toolName: 'mcp__electronics__claim_item',
+      toolName: 'mcp__electronics__my_queue',
     });
     const parsed = JSON.parse(first.stdout);
     expect(parsed.hookSpecificOutput.additionalContext).toContain('lat search');
 
     const second = runHook('claude', 'PostToolUse', clean, {
       sessionId,
-      toolName: 'mcp__electronics__my_queue',
+      toolName: 'mcp__electronics__view_item',
+    });
+    expect(second.stdout).toBe('');
+  });
+
+  // @lat: [[tests/hook#Claim auto-search falls back to the reminder]]
+  it('claim with a response but no index falls back to the static reminder, then quiets', () => {
+    const sessionId = uniqueSessionId();
+    const first = runHook('claude', 'PostToolUse', clean, {
+      sessionId,
+      toolName: 'mcp__electronics__claim_item',
+      toolResponseText: '{"id":"PA-1","summary":"fix the widget lifecycle"}',
+    });
+    const parsed = JSON.parse(first.stdout);
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('lat search');
+
+    const second = runHook('claude', 'PostToolUse', clean, {
+      sessionId,
+      toolName: 'mcp__electronics__claim_item',
+      toolResponseText: '{"id":"PA-2","summary":"another item"}',
     });
     expect(second.stdout).toBe('');
   });
