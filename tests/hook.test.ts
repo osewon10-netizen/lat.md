@@ -240,6 +240,83 @@ describe('hook pre-tool-use (commit gate)', () => {
   });
 });
 
+describe('hook pre-tool-use (session fire ceiling)', () => {
+  // @lat: [[tests/hook#Commit gate speaks at most twice per session]]
+  it('denies at most twice per session across distinct staged states', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/a.ts']]));
+    const sessionId = uniqueSessionId();
+    const commitOpts = {
+      fakeBinDir,
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'git commit -m x',
+    };
+    try {
+      const first = runHook('claude', 'PreToolUse', clean, commitOpts);
+      expect(JSON.parse(first.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+
+      writeFileSync(join(fakeBinDir, 'numstat.txt'), numstat([[90, 40, 'src/b.ts']]));
+      const second = runHook('claude', 'PreToolUse', clean, commitOpts);
+      expect(JSON.parse(second.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+
+      writeFileSync(join(fakeBinDir, 'numstat.txt'), numstat([[100, 50, 'src/c.ts']]));
+      const third = runHook('claude', 'PreToolUse', clean, commitOpts);
+      expect(third.stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook pre-tool-use (push checks)', () => {
+  // @lat: [[tests/hook#Push gate denies a stranded lat.md fold once]]
+  it('denies a push once when lat.md/ has uncommitted changes, then informs, then quiets', () => {
+    // The arg-blind fake git returns the same non-empty output for the
+    // porcelain and log probes, exercising fold-deny then manifest paths.
+    const fakeBinDir = makeFakeGitDir(numstat([[5, 1, 'lat.md/topic.md']]));
+    const sessionId = uniqueSessionId();
+    const pushOpts = {
+      fakeBinDir,
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'GIT_SSH=ssh.exe git push',
+    };
+    try {
+      const first = runHook('claude', 'PreToolUse', clean, pushOpts);
+      const firstParsed = JSON.parse(first.stdout);
+      expect(firstParsed.hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(firstParsed.hookSpecificOutput.permissionDecisionReason).toContain('lat.md');
+
+      const second = runHook('claude', 'PreToolUse', clean, pushOpts);
+      const secondParsed = JSON.parse(second.stdout);
+      expect(secondParsed.hookSpecificOutput.permissionDecision).toBeUndefined();
+      expect(secondParsed.hookSpecificOutput.additionalContext).toContain('About to push');
+
+      runHook('claude', 'PreToolUse', clean, pushOpts); // second manifest fire
+      const fourth = runHook('claude', 'PreToolUse', clean, pushOpts);
+      expect(fourth.stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Push checks stay silent on a clean tree]]
+  it('stays silent when nothing is stranded and nothing is unpushed', () => {
+    const fakeBinDir = makeFakeGitDir('');
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git push',
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
 describe('hook post-tool-use (work-start reminder)', () => {
   // @lat: [[tests/hook#Claim-time reminder fires once per session]]
   it('emits orientation on the first work-start tool call only', () => {

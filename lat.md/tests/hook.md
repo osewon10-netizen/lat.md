@@ -52,6 +52,21 @@ from the PreToolUse handler.
 
 Staged `lat.md/` changes above the ratio let the commit proceed silently.
 
+## Commit gate speaks at most twice per session
+
+Across DISTINCT staged states, the commit gate denies at most twice per
+session (the global fire ceiling) — a third distinct state passes silently.
+
+## Push gate denies a stranded lat.md fold once
+
+A push with uncommitted `lat.md/` changes is denied once with the
+fold-lands-before-the-push reminder; the retry gets the unpushed-commit
+manifest as advisory context, and after the budget, silence.
+
+## Push checks stay silent on a clean tree
+
+With nothing stranded and nothing unpushed, a push produces no hook output.
+
 ## Claim-time reminder fires once per session
 
 The PostToolUse handler emits the lat orientation context on the first

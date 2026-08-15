@@ -275,11 +275,20 @@ Conditionally blocks the agent from stopping — only when something is actually
 4. **First pass** — run `git diff HEAD --numstat`. When stdin carries a `transcript_path` (Claude Code supplies it), restrict the tally to files this session actually edited — write-tool calls (Edit/Write/MultiEdit/NotebookEdit) parsed from the transcript, matched by suffix against the repo-relative numstat paths, case-insensitive across slash styles. On a shared working tree another session's in-flight diff must not nag a bystander session: the sync debt follows authorship (2026-08-15; shell-mediated edits are invisible to this heuristic and don't count). Missing/unreadable transcript disables attribution and keeps the unfiltered tally. Then count `codeLines` (files matching [[src/source-parser.ts#SOURCE_EXTENSIONS]]) and `latMdLines`. Skip ratio check if `codeLines < 5` or `latMdLines >= 50` (enough doc work was clearly done). Otherwise round `latMdLines` up to 1 (if nonzero) and flag `needsSync` when `latMdLines < codeLines * 5%`.
 5. **Decision** — both pass: exit silently, clean output. Check failed + needs sync: block ("update `lat.md/`, then run `lat check` until it passes"). Check failed only: block ("run `lat check` until it passes"). Needs sync only: block with explicit context ("not updated" when 0 lat.md lines, "may not be fully in sync (N lines)" when some changes exist but below ratio).
 
-### PreToolUse — commit-time sync gate
+### PreToolUse — commit-time sync gate and push checks
 
-Attach via a settings matcher to `Bash`: a git-commit command whose STAGED
-diff has code without a proportional staged `lat.md/` update is denied once
-with the fold reminder, then yields on retry.
+Attach via a settings matcher to `Bash`: a git-commit whose STAGED diff has
+code without a proportional staged `lat.md/` update is denied once then
+yields; a git-push gets the stranded-fold check and the unpushed manifest.
+
+Every hook surface obeys a HARD CEILING of two firings per session
+(`tryFire` counter files in the OS tmpdir keyed by session + repo + surface;
+2026-08-15 operator rule) — repeated hook text is context an agent pays for
+on every subsequent request. Push specifics: uncommitted `lat.md/` changes
+at push time (a fold written but not committed) deny once and yield on
+retry; the manifest (`git log @{upstream}..HEAD --oneline`) is injected as
+advisory `additionalContext` with NO permission decision — an `allow` would
+silently bypass the user's permission prompt for the push.
 
 The staged diff (`git diff --cached --numstat`) is what the imminent commit
 actually ships, so co-tenant working-tree noise is structurally excluded and

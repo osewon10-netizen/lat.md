@@ -111,16 +111,40 @@ async function searchAndExpand(
 const SEARCH_CONTEXT_BUDGET = 8000;
 
 /**
- * Marker file for "this session already received the static reminder", in the
- * OS tmpdir keyed by session + repo. The boilerplate is paid once per session;
- * repeat prompts get only per-prompt output (ref expansion, search matches).
+ * Per-session fire budget for a hook surface, as a counter file in the OS
+ * tmpdir keyed by session + repo + surface. Returns true (and increments)
+ * while under the limit. HARD CEILING: no hook surface speaks more than
+ * twice per session — repeated hook text is context an agent pays for on
+ * every subsequent request. No session id fails open (fires every time).
  */
-function reminderMarkerPath(sessionId: string, latDir: string): string {
+const MAX_FIRES_PER_SESSION = 2;
+
+function tryFire(
+  sessionId: string,
+  latDir: string,
+  surface: string,
+  limit = 1,
+): boolean {
+  if (!sessionId) return true;
+  const capped = Math.min(limit, MAX_FIRES_PER_SESSION);
   const key = createHash('sha1')
-    .update(sessionId + '\0' + latDir)
+    .update(sessionId + '\0' + latDir + '\0' + surface)
     .digest('hex')
     .slice(0, 16);
-  return join(tmpdir(), 'lat-reminded-' + key);
+  const path = join(tmpdir(), 'lat-hookfire-' + key);
+  let count = 0;
+  try {
+    count = parseInt(readFileSync(path, 'utf-8'), 10) || 0;
+  } catch {
+    // No counter yet.
+  }
+  if (count >= capped) return false;
+  try {
+    writeFileSync(path, String(count + 1));
+  } catch {
+    // Unwritable tmpdir just means we may fire again next time.
+  }
+  return true;
 }
 
 async function handleUserPromptSubmit(): Promise<void> {
@@ -138,21 +162,7 @@ async function handleUserPromptSubmit(): Promise<void> {
   const parts: string[] = [];
   const latDir = findLatticeDir();
 
-  // No session id (older harness) fails open: remind on every prompt.
-  let firstPromptOfSession = true;
-  if (sessionId) {
-    const marker = reminderMarkerPath(sessionId, latDir ?? '');
-    firstPromptOfSession = !existsSync(marker);
-    if (firstPromptOfSession) {
-      try {
-        writeFileSync(marker, '');
-      } catch {
-        // Unwritable tmpdir just means we remind again next prompt.
-      }
-    }
-  }
-
-  if (firstPromptOfSession) {
+  if (tryFire(sessionId ?? '', latDir ?? '', 'prompt-reminder', 1)) {
     parts.push(
       'If this prompt starts NEW work in this repo (implementing, debugging, reviewing, or planning a change), orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — the graph holds design law the code cannot show.',
       'Skip the search for conversational follow-ups, questions about content already in context, and non-repo tasks — searching there is noise, not diligence.',
@@ -485,11 +495,22 @@ async function handleClaudePreToolUse(): Promise<void> {
   } catch {
     return;
   }
-  if (toolName !== 'Bash' || !isGitCommitCommand(command)) return;
+  if (toolName !== 'Bash') return;
 
   const latDir = findLatticeDir();
   if (!latDir) return;
 
+  if (isGitCommitCommand(command)) {
+    await commitSyncGate(latDir, sessionId);
+  } else if (isGitPushCommand(command)) {
+    await pushChecks(latDir, sessionId);
+  }
+}
+
+async function commitSyncGate(
+  latDir: string,
+  sessionId: string,
+): Promise<void> {
   const { codeLines, latMdLines } = tallyDiff(
     analyzeDiff(dirname(latDir), true),
     null,
@@ -501,12 +522,16 @@ async function handleClaudePreToolUse(): Promise<void> {
   }
   if (!needsSync) return;
 
+  // Identical staged state retried = deliberate proceed: yield silently and
+  // WITHOUT consuming the session's fire budget.
   const stagedSig = createHash('sha1')
     .update(sessionId + '\0' + codeLines + ':' + latMdLines)
     .digest('hex')
     .slice(0, 16);
   const marker = join(tmpdir(), 'lat-commit-nudge-' + stagedSig);
   if (existsSync(marker)) return;
+
+  if (!tryFire(sessionId, latDir, 'commit-gate', MAX_FIRES_PER_SESSION)) return;
   try {
     writeFileSync(marker, '');
   } catch {
@@ -525,6 +550,82 @@ async function handleClaudePreToolUse(): Promise<void> {
       },
     }),
   );
+}
+
+/** A Bash command that pushes to a remote, judged per segment like commits. */
+function isGitPushCommand(command: string): boolean {
+  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+    if (/\bgit\b/.test(segment) && /\bpush\b/.test(segment)) return true;
+  }
+  return false;
+}
+
+/**
+ * Push-time checks. (1) Stranded fold: uncommitted lat.md/ changes at push
+ * time mean a fold was written but not committed — folds land BEFORE the
+ * push; deny once, yield on retry. (2) Co-tenant manifest: inject the
+ * unpushed-commit list so the agent eyeballs exactly what it is about to
+ * ship on a shared tree (advisory allow; ignored harmlessly by harnesses
+ * without PreToolUse additionalContext support).
+ */
+async function pushChecks(latDir: string, sessionId: string): Promise<void> {
+  const root = dirname(latDir);
+  const run = (cmd: string): string => {
+    try {
+      return execSync(cmd, {
+        cwd: root,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return '';
+    }
+  };
+
+  const stranded = run('git status --porcelain -- lat.md/').trim();
+  if (stranded) {
+    const sig = createHash('sha1')
+      .update(sessionId + '\0' + stranded)
+      .digest('hex')
+      .slice(0, 16);
+    const marker = join(tmpdir(), 'lat-push-nudge-' + sig);
+    if (!existsSync(marker) && tryFire(sessionId, latDir, 'push-gate', MAX_FIRES_PER_SESSION)) {
+      try {
+        writeFileSync(marker, '');
+      } catch {
+        // Unwritable tmpdir: nudge again next time.
+      }
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              'Uncommitted lat.md/ changes at push time — the fold lands BEFORE the push:\n' +
+              stranded +
+              '\nCommit the fold (and run `lat check`), or re-run the push to proceed as-is.',
+          },
+        }),
+      );
+      return;
+    }
+  }
+
+  const unpushed = run('git log @{upstream}..HEAD --oneline').trim();
+  if (unpushed && tryFire(sessionId, latDir, 'push-manifest', MAX_FIRES_PER_SESSION)) {
+    // No permissionDecision: an 'allow' would silently bypass the user's
+    // permission prompt for the push — context only, permission flow untouched.
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          additionalContext:
+            'About to push these commits (shared tree — verify every one is yours):\n' +
+            unpushed,
+        },
+      }),
+    );
+  }
 }
 
 /**
@@ -547,15 +648,7 @@ async function handleClaudePostToolUse(): Promise<void> {
   const latDir = findLatticeDir();
   if (!latDir) return;
 
-  if (sessionId) {
-    const marker = reminderMarkerPath('post:' + sessionId, latDir);
-    if (existsSync(marker)) return;
-    try {
-      writeFileSync(marker, '');
-    } catch {
-      // Unwritable tmpdir just means we remind again on the next claim.
-    }
-  }
+  if (!tryFire(sessionId, latDir, 'work-start', 1)) return;
 
   process.stdout.write(
     JSON.stringify({
