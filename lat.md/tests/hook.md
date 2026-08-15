@@ -4,9 +4,25 @@ lat:
 ---
 # Hook
 
-Functional tests for the Stop hook. Runs `lat hook claude Stop` as a subprocess against test case fixtures, with a fake `git` script injected via PATH to control `git diff HEAD --numstat` output.
+Functional tests for the Stop and UserPromptSubmit hooks. Runs `lat hook claude <event>` as a subprocess against test case fixtures, with a fake `git` script injected via PATH to control `git diff HEAD --numstat` output.
 
 Tests in `tests/hook.test.ts`.
+
+## Reminder emitted once per session
+
+With a `session_id` on stdin, the static lat.md reminder is emitted on the
+first prompt of the session only; a repeat prompt in the same session gets no
+reminder (a tmpdir marker keyed by session + repo records the first emission).
+
+## Missing session id reminds every prompt
+
+Without a `session_id`, the hook fails open and emits the reminder on every
+prompt — the pre-dedup behavior for callers that don't supply one.
+
+## Distinct sessions each get one reminder
+
+Two different session ids each get their own first-prompt reminder; dedup is
+per session, not global.
 
 ## Exits silently when check passes and no diff
 
@@ -19,6 +35,28 @@ When `lat check` finds errors, the hook outputs a block decision with a reason m
 ## Blocks when code diff is large but lat.md/ not updated
 
 When check passes but `git diff --numstat` shows code changes above the threshold with no `lat.md/` changes, the hook blocks with a reminder to update `lat.md/`.
+
+## Commit gate denies once on staged code without lat.md
+
+A `git commit` Bash command with staged code above threshold and no staged
+`lat.md/` update is denied with the fold reminder; the identical retry in the
+same session and staged state passes — one nudge per staged state, never a
+hard wall.
+
+## Commit gate ignores non-commit commands
+
+Bash commands without a git-commit segment (e.g. `git log`) produce no output
+from the PreToolUse handler.
+
+## Commit gate passes proportional staged lat.md
+
+Staged `lat.md/` changes above the ratio let the commit proceed silently.
+
+## Claim-time reminder fires once per session
+
+The PostToolUse handler emits the lat orientation context on the first
+work-start tool call of a session (queue read / item claim) and stays silent
+on subsequent ones.
 
 ## Session attribution suppresses another session's diff
 

@@ -251,12 +251,14 @@ Usage: `lat hook <agent> <event>`
 
 Currently supports:
 
-- `claude` with `UserPromptSubmit` and `Stop`
+- `claude` with `UserPromptSubmit`, `Stop`, `PreToolUse`, and `PostToolUse`
 - `cursor` with `stop`
 
 ### UserPromptSubmit
 
-Reads the hook input from stdin (JSON with `user_prompt`). Outputs JSON with `additionalContext` containing:
+Reads the hook input from stdin (JSON with `user_prompt` and `session_id`). Outputs JSON with `additionalContext` containing:
+
+Items 1–2 (the static reminder) are emitted ONCE per session: a tmpdir marker keyed by `session_id` + repo records the first emission, and repeat prompts get only the per-prompt output (items 3–4). No `session_id` fails open to reminding every prompt; when nothing at all would be emitted, the hook produces no output (2026-08-15 — a long session should not pay for the same boilerplate on every message).
 
 1. A directive to run `lat search` on the task intent when the prompt starts NEW work (implementing, debugging, reviewing, planning a change), with explicit skip cases — conversational follow-ups, questions about content already in context, and non-repo tasks — so the reminder doesn't fire as noise on every message (scoped 2026-08-15; the original wording was an unconditional ALWAYS with a hard read-nothing-first gate).
 2. A reminder that `lat.md/` must stay in sync with the codebase — update relevant sections and run `lat check` before finishing.
@@ -272,6 +274,31 @@ Conditionally blocks the agent from stopping — only when something is actually
 3. **Second pass** (`stop_hook_active` true) — if check still fails, print warning to stderr (no block, loop stops). If check passes, exit silently.
 4. **First pass** — run `git diff HEAD --numstat`. When stdin carries a `transcript_path` (Claude Code supplies it), restrict the tally to files this session actually edited — write-tool calls (Edit/Write/MultiEdit/NotebookEdit) parsed from the transcript, matched by suffix against the repo-relative numstat paths, case-insensitive across slash styles. On a shared working tree another session's in-flight diff must not nag a bystander session: the sync debt follows authorship (2026-08-15; shell-mediated edits are invisible to this heuristic and don't count). Missing/unreadable transcript disables attribution and keeps the unfiltered tally. Then count `codeLines` (files matching [[src/source-parser.ts#SOURCE_EXTENSIONS]]) and `latMdLines`. Skip ratio check if `codeLines < 5` or `latMdLines >= 50` (enough doc work was clearly done). Otherwise round `latMdLines` up to 1 (if nonzero) and flag `needsSync` when `latMdLines < codeLines * 5%`.
 5. **Decision** — both pass: exit silently, clean output. Check failed + needs sync: block ("update `lat.md/`, then run `lat check` until it passes"). Check failed only: block ("run `lat check` until it passes"). Needs sync only: block with explicit context ("not updated" when 0 lat.md lines, "may not be fully in sync (N lines)" when some changes exist but below ratio).
+
+### PreToolUse — commit-time sync gate
+
+Attach via a settings matcher to `Bash`: a git-commit command whose STAGED
+diff has code without a proportional staged `lat.md/` update is denied once
+with the fold reminder, then yields on retry.
+
+The staged diff (`git diff --cached --numstat`) is what the imminent commit
+actually ships, so co-tenant working-tree noise is structurally excluded and
+no session attribution is needed — and the nudge lands at the moment the
+agent can still stage the fold into the same commit. A tmpdir marker keyed by
+session + staged tally makes the gate yield on retry: one nudge per staged
+state, never a hard wall (2026-08-15, operator-directed — replaces the
+turn-end Stop nag as the primary sync enforcement point on repos that wire
+it).
+
+### PostToolUse — work-start orientation
+
+Attach via settings matchers to the tools that begin real work: the handler
+emits the lat orientation reminder as `additionalContext` when an item is
+picked up, once per session.
+
+Intended matchers are the ticketing surface's queue read and item claim —
+the point where `lat search` is actually relevant. Uses the same tmpdir
+marker scheme as the prompt-submit reminder.
 
 ### cursor stop
 

@@ -75,11 +75,19 @@ function runHook(
     stopHookActive?: boolean;
     fakeBinDir?: string;
     transcriptPath?: string;
+    userPrompt?: string;
+    sessionId?: string;
+    toolName?: string;
+    toolCommand?: string;
   } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
   const stdinJson = JSON.stringify({
     stop_hook_active: opts.stopHookActive ?? false,
     ...(opts.transcriptPath ? { transcript_path: opts.transcriptPath } : {}),
+    ...(opts.userPrompt ? { user_prompt: opts.userPrompt } : {}),
+    ...(opts.sessionId ? { session_id: opts.sessionId } : {}),
+    ...(opts.toolName ? { tool_name: opts.toolName } : {}),
+    ...(opts.toolCommand ? { tool_input: { command: opts.toolCommand } } : {}),
   });
 
   const env: Record<string, string> = {
@@ -123,6 +131,133 @@ function runStopHook(
 
 const clean = join(casesDir, 'hook-clean');
 const broken = join(casesDir, 'error-broken-links');
+
+function uniqueSessionId(): string {
+  return `test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+describe('hook prompt submit', () => {
+  // @lat: [[tests/hook#Reminder emitted once per session]]
+  it('emits the static reminder on the first prompt of a session only', () => {
+    const sessionId = uniqueSessionId();
+    const first = runHook('claude', 'UserPromptSubmit', clean, {
+      userPrompt: 'do a thing',
+      sessionId,
+    });
+    expect(first.stdout).toContain('lat search');
+    expect(first.stdout).toContain('stay in sync');
+
+    const second = runHook('claude', 'UserPromptSubmit', clean, {
+      userPrompt: 'another thing',
+      sessionId,
+    });
+    expect(second.stdout).not.toContain('stay in sync');
+  });
+
+  // @lat: [[tests/hook#Missing session id reminds every prompt]]
+  it('reminds on every prompt when no session_id is supplied', () => {
+    for (let i = 0; i < 2; i++) {
+      const { stdout } = runHook('claude', 'UserPromptSubmit', clean, {
+        userPrompt: 'do a thing',
+      });
+      expect(stdout).toContain('stay in sync');
+    }
+  });
+
+  // @lat: [[tests/hook#Distinct sessions each get one reminder]]
+  it('a second session still gets its own first-prompt reminder', () => {
+    const a = uniqueSessionId();
+    const b = uniqueSessionId();
+    runHook('claude', 'UserPromptSubmit', clean, { userPrompt: 'x', sessionId: a });
+    const { stdout } = runHook('claude', 'UserPromptSubmit', clean, {
+      userPrompt: 'y',
+      sessionId: b,
+    });
+    expect(stdout).toContain('stay in sync');
+  });
+});
+
+describe('hook pre-tool-use (commit gate)', () => {
+  // @lat: [[tests/hook#Commit gate denies once on staged code without lat.md]]
+  it('denies a git commit once when staged code has no lat.md update, then yields', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/big-refactor.ts']]));
+    const sessionId = uniqueSessionId();
+    try {
+      const first = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId,
+        toolName: 'Bash',
+        toolCommand: 'git commit -F /tmp/msg.txt',
+      });
+      const parsed = JSON.parse(first.stdout);
+      expect(parsed.hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain('lat.md');
+
+      const second = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId,
+        toolName: 'Bash',
+        toolCommand: 'git commit -F /tmp/msg.txt',
+      });
+      expect(second.stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Commit gate ignores non-commit commands]]
+  it('stays silent for non-commit Bash commands', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/big-refactor.ts']]));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git log --oneline -5',
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Commit gate passes proportional staged lat.md]]
+  it('stays silent when staged lat.md changes are proportional', () => {
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[60, 40, 'src/feature.ts'], [8, 2, 'lat.md/feature.md']]),
+    );
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git commit -m x',
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook post-tool-use (work-start reminder)', () => {
+  // @lat: [[tests/hook#Claim-time reminder fires once per session]]
+  it('emits orientation on the first work-start tool call only', () => {
+    const sessionId = uniqueSessionId();
+    const first = runHook('claude', 'PostToolUse', clean, {
+      sessionId,
+      toolName: 'mcp__electronics__claim_item',
+    });
+    const parsed = JSON.parse(first.stdout);
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('lat search');
+
+    const second = runHook('claude', 'PostToolUse', clean, {
+      sessionId,
+      toolName: 'mcp__electronics__my_queue',
+    });
+    expect(second.stdout).toBe('');
+  });
+});
 
 describe('hook stop', () => {
   // @lat: [[tests/hook#Exits silently when check passes and no diff]]

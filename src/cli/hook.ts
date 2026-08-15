@@ -1,6 +1,8 @@
 import { execSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { dirname, extname } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { dirname, extname, join } from 'node:path';
 import { findLatticeDir } from '../lattice.js';
 import { plainStyler, type CmdContext } from '../context.js';
 import { expandPrompt } from './expand.js';
@@ -82,37 +84,82 @@ async function searchAndExpand(
     '',
   ];
 
+  // Budget the injection: full sections can run tens of KB per prompt, and
+  // this fires on EVERY prompt — omitted matches stay one `lat section` away.
+  let used = 0;
+  let included = 0;
   for (const match of result.matches) {
     const sectionResult = await getSection(ctx, match.section.id);
-    if (sectionResult.kind === 'found') {
-      parts.push(formatSectionOutput(ctx, sectionResult));
-      parts.push('');
-    }
+    if (sectionResult.kind !== 'found') continue;
+    const block = formatSectionOutput(ctx, sectionResult);
+    if (included > 0 && used + block.length > SEARCH_CONTEXT_BUDGET) break;
+    parts.push(block, '');
+    used += block.length;
+    included++;
+  }
+  const omitted = result.matches.length - included;
+  if (omitted > 0) {
+    parts.push(
+      `(${omitted} lower-ranked match(es) omitted for context budget — run \`lat search\` and \`lat section\` to read them.)`,
+    );
   }
 
   return parts.join('\n');
 }
 
+/** Char budget for the per-prompt search injection. */
+const SEARCH_CONTEXT_BUDGET = 8000;
+
+/**
+ * Marker file for "this session already received the static reminder", in the
+ * OS tmpdir keyed by session + repo. The boilerplate is paid once per session;
+ * repeat prompts get only per-prompt output (ref expansion, search matches).
+ */
+function reminderMarkerPath(sessionId: string, latDir: string): string {
+  const key = createHash('sha1')
+    .update(sessionId + '\0' + latDir)
+    .digest('hex')
+    .slice(0, 16);
+  return join(tmpdir(), 'lat-reminded-' + key);
+}
+
 async function handleUserPromptSubmit(): Promise<void> {
   let userPrompt = '';
+  let sessionId: string | undefined;
   try {
     const raw = await readStdin();
     const input = JSON.parse(raw);
     userPrompt = input.user_prompt ?? '';
+    if (typeof input.session_id === 'string') sessionId = input.session_id;
   } catch {
     // If we can't parse stdin, still emit the reminder
   }
 
   const parts: string[] = [];
-
-  parts.push(
-    'If this prompt starts NEW work in this repo (implementing, debugging, reviewing, or planning a change), orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — the graph holds design law the code cannot show.',
-    'Skip the search for conversational follow-ups, questions about content already in context, and non-repo tasks — searching there is noise, not diligence.',
-    '',
-    'Remember: `lat.md/` must stay in sync with the codebase. If you change code or behavior, update the relevant `lat.md/` sections and run `lat check` before finishing.',
-  );
-
   const latDir = findLatticeDir();
+
+  // No session id (older harness) fails open: remind on every prompt.
+  let firstPromptOfSession = true;
+  if (sessionId) {
+    const marker = reminderMarkerPath(sessionId, latDir ?? '');
+    firstPromptOfSession = !existsSync(marker);
+    if (firstPromptOfSession) {
+      try {
+        writeFileSync(marker, '');
+      } catch {
+        // Unwritable tmpdir just means we remind again next prompt.
+      }
+    }
+  }
+
+  if (firstPromptOfSession) {
+    parts.push(
+      'If this prompt starts NEW work in this repo (implementing, debugging, reviewing, or planning a change), orient before reading source: `lat search` with queries describing the intent, then `lat section` on relevant hits — the graph holds design law the code cannot show.',
+      'Skip the search for conversational follow-ups, questions about content already in context, and non-repo tasks — searching there is noise, not diligence.',
+      '',
+      'Remember: `lat.md/` must stay in sync with the codebase. If you change code or behavior, update the relevant `lat.md/` sections and run `lat check` before finishing.',
+    );
+  }
   if (latDir && userPrompt) {
     const ctx = makeHookCtx(latDir);
 
@@ -151,7 +198,9 @@ async function handleUserPromptSubmit(): Promise<void> {
     }
   }
 
-  outputClaudePromptSubmit(parts.join('\n'));
+  const context = parts.join('\n').replace(/^\n+/, '');
+  if (!context) return;
+  outputClaudePromptSubmit(context);
 }
 
 /** Minimum diff size (in lines) to consider "significant" code change. */
@@ -166,17 +215,24 @@ const LATMD_UPPER_THRESHOLD = 50;
 
 type DiffEntry = { file: string; changed: number; isLat: boolean };
 
-/** Run `git diff HEAD --numstat` and return one entry per counted file. */
-function analyzeDiff(projectRoot: string): DiffEntry[] {
+/**
+ * Run git numstat and return one entry per counted file. Default scope is the
+ * whole working tree vs HEAD; `staged` restricts to the index (`--cached`) —
+ * what the imminent commit actually ships, which needs no session attribution.
+ */
+function analyzeDiff(projectRoot: string, staged = false): DiffEntry[] {
   let output: string;
   try {
     // stderr ignored: git emits advisory warnings (e.g. CRLF conversion) that
     // would otherwise leak into the agent-facing hook stderr.
-    output = execSync('git diff HEAD --numstat', {
-      cwd: projectRoot,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
+    output = execSync(
+      staged ? 'git diff --cached --numstat' : 'git diff HEAD --numstat',
+      {
+        cwd: projectRoot,
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      },
+    );
   } catch {
     return [];
   }
@@ -396,6 +452,124 @@ async function handleClaudeStop(): Promise<void> {
   outputClaudeStop(reason);
 }
 
+/**
+ * A Bash command that creates a git commit. Segment-wise so `GIT_SSH=... git
+ * push && git commit` chains are judged per segment; modest false positives
+ * (e.g. `git log --grep commit`) are tolerable — the gate only speaks when
+ * staged code has lat.md debt, and yields after one nudge per staged state.
+ */
+function isGitCommitCommand(command: string): boolean {
+  for (const segment of command.split(/&&|\|\||[;|\n]/)) {
+    if (/\bgit\b/.test(segment) && /\bcommit\b/.test(segment)) return true;
+  }
+  return false;
+}
+
+/**
+ * PreToolUse (attach via settings matcher to Bash): when the command is a git
+ * commit and the STAGED diff has code changes without a proportional lat.md
+ * update, deny once with the fold reminder — the moment the agent can still
+ * stage the fold into the same commit. Re-running the commit proceeds: one
+ * nudge per staged state per session, never a hard wall.
+ */
+async function handleClaudePreToolUse(): Promise<void> {
+  let sessionId = '';
+  let toolName = '';
+  let command = '';
+  try {
+    const raw = await readStdin();
+    const input = JSON.parse(raw);
+    if (typeof input.session_id === 'string') sessionId = input.session_id;
+    toolName = input.tool_name ?? '';
+    command = input.tool_input?.command ?? '';
+  } catch {
+    return;
+  }
+  if (toolName !== 'Bash' || !isGitCommitCommand(command)) return;
+
+  const latDir = findLatticeDir();
+  if (!latDir) return;
+
+  const { codeLines, latMdLines } = tallyDiff(
+    analyzeDiff(dirname(latDir), true),
+    null,
+  );
+  let needsSync = false;
+  if (codeLines >= DIFF_THRESHOLD && latMdLines < LATMD_UPPER_THRESHOLD) {
+    const effectiveLatMd = latMdLines === 0 ? 0 : Math.max(latMdLines, 1);
+    needsSync = effectiveLatMd < codeLines * LATMD_RATIO;
+  }
+  if (!needsSync) return;
+
+  const stagedSig = createHash('sha1')
+    .update(sessionId + '\0' + codeLines + ':' + latMdLines)
+    .digest('hex')
+    .slice(0, 16);
+  const marker = join(tmpdir(), 'lat-commit-nudge-' + stagedSig);
+  if (existsSync(marker)) return;
+  try {
+    writeFileSync(marker, '');
+  } catch {
+    // Unwritable tmpdir: nudge again next time rather than block repeatedly.
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          `This commit stages ${codeLines} code line(s) with ${latMdLines === 0 ? 'no' : 'only ' + latMdLines + ' line(s) of'} lat.md/ update. ` +
+          'If the change alters behavior, architecture, or tests, fold the durable invariant into `lat.md/` and stage it with this commit (then `lat check`). ' +
+          'If the fold genuinely belongs elsewhere (docs-only stack, fold lands in a later commit of this push), just re-run the commit — this gate yields after one nudge per staged state.',
+      },
+    }),
+  );
+}
+
+/**
+ * PostToolUse (attach via settings matcher to work-start tools, e.g. a queue
+ * read or an item claim): inject the lat orientation reminder at the moment an
+ * item is actually picked up. Once per session.
+ */
+async function handleClaudePostToolUse(): Promise<void> {
+  let sessionId = '';
+  let toolName = '';
+  try {
+    const raw = await readStdin();
+    const input = JSON.parse(raw);
+    if (typeof input.session_id === 'string') sessionId = input.session_id;
+    toolName = input.tool_name ?? '';
+  } catch {
+    return;
+  }
+
+  const latDir = findLatticeDir();
+  if (!latDir) return;
+
+  if (sessionId) {
+    const marker = reminderMarkerPath('post:' + sessionId, latDir);
+    if (existsSync(marker)) return;
+    try {
+      writeFileSync(marker, '');
+    } catch {
+      // Unwritable tmpdir just means we remind again on the next claim.
+    }
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: [
+          `Work item picked up (${toolName || 'queue tool'}). Before reading source for it: \`lat search\` the item's intent, then \`lat section\` on the relevant hits — the graph holds design law the code cannot show.`,
+          'When the change lands: fold durable invariants into `lat.md/` and get `lat check` green before the push.',
+        ].join('\n'),
+      },
+    }),
+  );
+}
+
 async function handleCursorStop(): Promise<void> {
   const latDir = findLatticeDir();
   if (!latDir) return;
@@ -415,9 +589,15 @@ export async function hookCmd(agent: string, event: string): Promise<void> {
         case 'Stop':
           await handleClaudeStop();
           return;
+        case 'PreToolUse':
+          await handleClaudePreToolUse();
+          return;
+        case 'PostToolUse':
+          await handleClaudePostToolUse();
+          return;
         default:
           console.error(
-            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop`,
+            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse`,
           );
           process.exit(1);
       }
