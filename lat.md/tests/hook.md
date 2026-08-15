@@ -86,6 +86,42 @@ still arrives as advisory context.
 
 With nothing stranded and nothing unpushed, a push produces no hook output.
 
+## Trap table injects the known fix once
+
+A failure whose text matches a `traps.md` signature gets the entry's fix
+injected as context; the same trap in the same session is silent afterwards.
+
+## Trap table stays silent without a match
+
+Failures matching no signature produce no output, and a trap entry with an
+invalid regex is skipped rather than fatal.
+
+## Docker guard denies a bare test run once
+
+`docker compose run --rm test` without `build` in the chain (in a repo with a
+docker-compose.yml) is denied once with the stale-COPY-layer reason; an
+identical retry and a proper `build && test` chain both pass.
+
+## Two-lab reminder rides the push manifest
+
+An outgoing stack touching `src/` with no `two-lab fold:` commit subject gets
+one advisory line appended to the push manifest — one message, two surfaces.
+
+## Two-lab reminder respects an existing fold commit
+
+A stack already carrying a `two-lab fold:` commit gets the manifest only.
+
+## Advisory pool bounds total pokes
+
+Once a session's shared advisory pool is spent across surfaces, further
+advisory output is silent; corrective output (deny gates, trap fixes) still
+speaks.
+
+## Worktree inherits the untracked settings
+
+WorktreeCreate copies the repo's `.claude/settings.json` into the new
+worktree and always exits 0.
+
 ## Claim-time reminder fires once per session
 
 The PostToolUse handler emits the lat orientation context on the first

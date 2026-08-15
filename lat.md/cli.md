@@ -323,6 +323,35 @@ state, never a hard wall (2026-08-15, operator-directed — replaces the
 turn-end Stop nag as the primary sync enforcement point on repos that wire
 it).
 
+### PostToolUseFailure — the trap table
+
+Matches a failed command's output against `lat.md/traps.md` (sections of
+`## trap: <name>` with a backticked `signature:` regex and a `fix:` line) and
+injects the known fix at the moment of recurrence, once per trap per session.
+
+This makes the graph's incident archaeology executable: every trap folded
+into `traps.md` starts firing automatically when its error recurs, instead
+of waiting to be read. Corrective — outside the advisory pool. Malformed
+entries are skipped, never fatal.
+
+### WorktreeCreate — settings propagation
+
+Copies the repo's untracked `.claude/settings.json` into a newly created
+worktree so isolated implementer subagents inherit the same hooks; always
+exits 0 (a failed copy must never fail worktree creation).
+
+### Advisory pool
+
+All advisory surfaces (orientation, reminders, manifests, the two-lab line)
+share one session-wide pool of six firings on top of per-surface caps, so
+total pokes stay bounded no matter how many surfaces exist.
+
+Corrective output — deny gates that fire only on real debt (commit sync,
+stranded fold, the docker stale-test guard) and trap fixes answering an
+error the agent just hit — bypasses the pool. Advisory parts that fire at
+the same moment merge into one message (e.g. the push manifest and the
+two-lab reminder).
+
 ### cursor stop
 
 Runs the same `lat check` and diff analysis as Claude's `Stop` hook, but emits Cursor's `followup_message` payload instead of Claude's block response so the agent continues its loop in Cursor.

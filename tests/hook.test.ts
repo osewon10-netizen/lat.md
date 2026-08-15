@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { join, delimiter } from 'node:path';
-import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { rmDirBestEffort } from './util.js';
 
@@ -27,19 +27,59 @@ function numstat(files: [number, number, string][]): string {
  * batch shim emit it — so the hook's `git diff --numstat` is intercepted on
  * every OS. Callers prepend this dir to PATH.
  */
-function makeFakeGitDir(output: string): string {
+function makeFakeGitDir(
+  output: string,
+  extra: {
+    nameonly?: string;
+    subjects?: string;
+    porcelain?: string;
+    oneline?: string;
+  } = {},
+): string {
   const dir = mkdtempSync(join(tmpdir(), 'lat-hook-'));
-  const dataFile = join(dir, 'numstat.txt');
-  writeFileSync(dataFile, output);
+  // Arg-aware shim: each probe kind reads its own data file; kinds not
+  // overridden fall back to the main output (the original arg-blind behavior).
+  writeFileSync(join(dir, 'numstat.txt'), output);
+  writeFileSync(join(dir, 'nameonly.txt'), extra.nameonly ?? output);
+  writeFileSync(join(dir, 'subjects.txt'), extra.subjects ?? output);
+  writeFileSync(join(dir, 'porcelain.txt'), extra.porcelain ?? output);
+  writeFileSync(join(dir, 'oneline.txt'), extra.oneline ?? output);
 
   // POSIX: `git` shell script.
   const shScript = join(dir, 'git');
-  writeFileSync(shScript, '#!/bin/sh\ncat "$(dirname "$0")/numstat.txt"\n');
+  writeFileSync(
+    shScript,
+    [
+      '#!/bin/sh',
+      'd="$(dirname "$0")"',
+      'case "$*" in',
+      '  *--numstat*) cat "$d/numstat.txt";;',
+      '  *--name-only*) cat "$d/nameonly.txt";;',
+      '  *--porcelain*) cat "$d/porcelain.txt";;',
+      '  *--format=%s*) cat "$d/subjects.txt";;',
+      '  *--oneline*) cat "$d/oneline.txt";;',
+      '  *) cat "$d/numstat.txt";;',
+      'esac',
+      '',
+    ].join('\n'),
+  );
   chmodSync(shScript, 0o755);
 
   // Windows: `git.cmd` batch shim (resolved via PATHEXT). `type` preserves tabs.
   const cmdScript = join(dir, 'git.cmd');
-  writeFileSync(cmdScript, '@type "%~dp0numstat.txt"\r\n');
+  writeFileSync(
+    cmdScript,
+    [
+      '@echo off',
+      'echo %* | findstr /C:"--numstat" >nul 2>&1 && (type "%~dp0numstat.txt" & exit /b 0)',
+      'echo %* | findstr /C:"--name-only" >nul 2>&1 && (type "%~dp0nameonly.txt" & exit /b 0)',
+      'echo %* | findstr /C:"--porcelain" >nul 2>&1 && (type "%~dp0porcelain.txt" & exit /b 0)',
+      'echo %* | findstr /C:"--format" >nul 2>&1 && (type "%~dp0subjects.txt" & exit /b 0)',
+      'echo %* | findstr /C:"--oneline" >nul 2>&1 && (type "%~dp0oneline.txt" & exit /b 0)',
+      'type "%~dp0numstat.txt"',
+      '\r\n',
+    ].join('\r\n'),
+  );
 
   return dir;
 }
@@ -81,6 +121,7 @@ function runHook(
     toolCommand?: string;
     source?: string;
     toolResponseText?: string;
+    worktreePath?: string;
   } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
   const stdinJson = JSON.stringify({
@@ -94,6 +135,7 @@ function runHook(
     ...(opts.toolResponseText
       ? { tool_response: { content: [{ type: 'text', text: opts.toolResponseText }] } }
       : {}),
+    ...(opts.worktreePath ? { worktree_path: opts.worktreePath } : {}),
   });
 
   const env: Record<string, string> = {
@@ -137,6 +179,7 @@ function runStopHook(
 
 const clean = join(casesDir, 'hook-clean');
 const broken = join(casesDir, 'error-broken-links');
+const traps = join(casesDir, 'hook-traps');
 
 function uniqueSessionId(): string {
   return `test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -362,6 +405,183 @@ describe('hook pre-tool-use (push checks)', () => {
       expect(stdout).toBe('');
     } finally {
       rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook post-tool-use-failure (trap table)', () => {
+  // @lat: [[tests/hook#Trap table injects the known fix once]]
+  it('injects the known fix on a matching failure, once per session', () => {
+    const sessionId = uniqueSessionId();
+    const first = runHook('claude', 'PostToolUseFailure', traps, {
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'uv run pytest tests -q',
+      toolResponseText: 'error: Failed to spawn: pytest',
+    });
+    const parsed = JSON.parse(first.stdout);
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('uv sync --extra dev');
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('uv-extras-uninstalled');
+
+    const second = runHook('claude', 'PostToolUseFailure', traps, {
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'uv run pytest tests -q',
+      toolResponseText: 'error: Failed to spawn: pytest',
+    });
+    expect(second.stdout).toBe('');
+  });
+
+  // @lat: [[tests/hook#Trap table stays silent without a match]]
+  it('stays silent for failures matching no trap (bad-regex entries skipped)', () => {
+    const { stdout } = runHook('claude', 'PostToolUseFailure', traps, {
+      sessionId: uniqueSessionId(),
+      toolName: 'Bash',
+      toolCommand: 'ls',
+      toolResponseText: 'No such file or directory',
+    });
+    expect(stdout).toBe('');
+  });
+});
+
+describe('hook pre-tool-use (docker stale-test guard)', () => {
+  // @lat: [[tests/hook#Docker guard denies a bare test run once]]
+  it('denies a bare run --rm test once, passes identical retry and build+test', () => {
+    const sessionId = uniqueSessionId();
+    const bare = {
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'docker compose run --rm test',
+    };
+    const first = runHook('claude', 'PreToolUse', clean, bare);
+    const parsed = JSON.parse(first.stdout);
+    expect(parsed.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain('COPY layer');
+
+    const retry = runHook('claude', 'PreToolUse', clean, bare);
+    expect(retry.stdout).toBe('');
+
+    const full = runHook('claude', 'PreToolUse', clean, {
+      sessionId,
+      toolName: 'Bash',
+      toolCommand: 'docker compose build && docker compose run --rm test',
+    });
+    expect(full.stdout).toBe('');
+  });
+});
+
+describe('hook pre-tool-use (two-lab push reminder)', () => {
+  // @lat: [[tests/hook#Two-lab reminder rides the push manifest]]
+  it('adds the two-lab line when outgoing src/ commits carry no fold', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[10, 2, 'src/x.ts']]), {
+      porcelain: '',
+      nameonly: 'src/x.ts\n',
+      subjects: 'TK-1: fix the thing\n',
+      oneline: 'abc1234 TK-1: fix the thing\n',
+    });
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git push',
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.permissionDecision).toBeUndefined();
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('two-lab');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Two-lab reminder respects an existing fold commit]]
+  it('omits the two-lab line when the stack already has a fold commit', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[10, 2, 'src/x.ts']]), {
+      porcelain: '',
+      nameonly: 'src/x.ts\n',
+      subjects: 'two-lab fold r1: things\nTK-1: fix\n',
+      oneline: 'abc1234 two-lab fold r1: things\n',
+    });
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git push',
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
+      expect(parsed.hookSpecificOutput.additionalContext).not.toContain('two-lab fold:` commit');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook global advisory budget', () => {
+  // @lat: [[tests/hook#Advisory pool bounds total pokes]]
+  it('silences advisory surfaces once the session pool is spent; corrective still speaks', () => {
+    const sessionId = uniqueSessionId();
+    const fakeBinDir = makeFakeGitDir('', {
+      oneline: 'abc1234 TK-1: fix\n',
+      porcelain: '',
+      nameonly: 'docs/readme.md\n',
+      subjects: 'TK-1: fix\n',
+    });
+    try {
+      // Spend the pool: orient(1) + work-start(1) + claim×2 + manifest×2 = 6.
+      runHook('claude', 'SessionStart', clean, { sessionId, source: 'startup' });
+      runHook('claude', 'PostToolUse', clean, { sessionId, toolName: 'mcp__electronics__my_queue' });
+      for (let i = 0; i < 2; i++) {
+        runHook('claude', 'PostToolUse', clean, {
+          sessionId,
+          toolName: 'mcp__electronics__claim_item',
+          toolResponseText: '{"summary":"item"}',
+        });
+      }
+      for (let i = 0; i < 2; i++) {
+        runHook('claude', 'PreToolUse', clean, {
+          fakeBinDir,
+          sessionId,
+          toolName: 'Bash',
+          toolCommand: 'git push',
+        });
+      }
+
+      // Pool spent: a compact re-anchor (advisory, own surface unused) is silent.
+      const advisory = runHook('claude', 'SessionStart', clean, {
+        sessionId,
+        source: 'compact',
+      });
+      expect(advisory.stdout).toBe('');
+
+      // Corrective still speaks: docker guard denies regardless of the pool.
+      const corrective = runHook('claude', 'PreToolUse', clean, {
+        sessionId,
+        toolName: 'Bash',
+        toolCommand: 'docker compose run --rm test',
+      });
+      expect(JSON.parse(corrective.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook worktree create', () => {
+  // @lat: [[tests/hook#Worktree inherits the untracked settings]]
+  it('copies .claude/settings.json into the new worktree', () => {
+    const wt = mkdtempSync(join(tmpdir(), 'lat-wt-'));
+    try {
+      const { exitCode } = runHook('claude', 'WorktreeCreate', clean, {
+        sessionId: uniqueSessionId(),
+        worktreePath: wt,
+      });
+      expect(exitCode).toBe(0);
+      expect(existsSync(join(wt, '.claude', 'settings.json'))).toBe(true);
+    } finally {
+      rmDirBestEffort(wt);
     }
   });
 });

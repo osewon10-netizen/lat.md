@@ -1,5 +1,11 @@
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join } from 'node:path';
@@ -120,31 +126,59 @@ const SEARCH_CONTEXT_BUDGET = 8000;
  */
 const MAX_FIRES_PER_SESSION = 2;
 
-function tryFire(
-  sessionId: string,
-  latDir: string,
-  surface: string,
-  limit = 1,
-): boolean {
-  if (!sessionId) return true;
-  const capped = Math.min(limit, MAX_FIRES_PER_SESSION);
-  const key = createHash('sha1')
-    .update(sessionId + '\0' + latDir + '\0' + surface)
-    .digest('hex')
-    .slice(0, 16);
-  const path = join(tmpdir(), 'lat-hookfire-' + key);
-  let count = 0;
+/**
+ * ADVISORY surfaces (orientation, reminders, manifests) additionally share
+ * one session-wide pool, so the sum of pokes stays bounded no matter how many
+ * surfaces exist. Corrective output — deny gates that fire only on real debt,
+ * and trap fixes answering an error the agent just hit — bypasses the pool.
+ */
+const GLOBAL_ADVISORY_BUDGET = 6;
+
+function readCounter(path: string): number {
   try {
-    count = parseInt(readFileSync(path, 'utf-8'), 10) || 0;
+    return parseInt(readFileSync(path, 'utf-8'), 10) || 0;
   } catch {
-    // No counter yet.
+    return 0;
   }
-  if (count >= capped) return false;
+}
+
+function bumpCounter(path: string, count: number): void {
   try {
     writeFileSync(path, String(count + 1));
   } catch {
     // Unwritable tmpdir just means we may fire again next time.
   }
+}
+
+function counterPath(sessionId: string, latDir: string, surface: string): string {
+  const key = createHash('sha1')
+    .update(sessionId + '\0' + latDir + '\0' + surface)
+    .digest('hex')
+    .slice(0, 16);
+  return join(tmpdir(), 'lat-hookfire-' + key);
+}
+
+function tryFire(
+  sessionId: string,
+  latDir: string,
+  surface: string,
+  limit = 1,
+  advisory = false,
+): boolean {
+  if (!sessionId) return true;
+  const capped = Math.min(limit, MAX_FIRES_PER_SESSION);
+  const path = counterPath(sessionId, latDir, surface);
+  const count = readCounter(path);
+  if (count >= capped) return false;
+
+  if (advisory) {
+    const globalPath = counterPath(sessionId, latDir, 'global-advisory');
+    const globalCount = readCounter(globalPath);
+    if (globalCount >= GLOBAL_ADVISORY_BUDGET) return false;
+    bumpCounter(globalPath, globalCount);
+  }
+
+  bumpCounter(path, count);
   return true;
 }
 
@@ -242,11 +276,11 @@ async function handleClaudeSessionStart(): Promise<void> {
   if (!latDir) return;
 
   if (source === 'compact') {
-    if (!tryFire(sessionId, latDir, 'compact-anchor', MAX_FIRES_PER_SESSION))
+    if (!tryFire(sessionId, latDir, 'compact-anchor', MAX_FIRES_PER_SESSION, true))
       return;
     outputClaudeContext('SessionStart', COMPACT_REANCHOR);
   } else {
-    if (!tryFire(sessionId, latDir, 'session-orient', 1)) return;
+    if (!tryFire(sessionId, latDir, 'session-orient', 1, true)) return;
     outputClaudeContext('SessionStart', ORIENTATION_REMINDER);
   }
 }
@@ -539,13 +573,81 @@ async function handleClaudePreToolUse(): Promise<void> {
   if (toolName !== 'Bash') return;
 
   const latDir = findLatticeDir();
-  if (!latDir) return;
+  const projectRoot = latDir ? dirname(latDir) : gitRoot();
+  if (!projectRoot) return;
 
+  // The docker guard is lat-independent — it protects any compose repo.
+  if (isDockerBareTestCommand(command)) {
+    dockerStaleTestGuard(projectRoot, sessionId, command);
+    return;
+  }
+
+  if (!latDir) return;
   if (isGitCommitCommand(command)) {
     await commitSyncGate(latDir, sessionId);
   } else if (isGitPushCommand(command)) {
     await pushChecks(latDir, sessionId, sessionTouchedFiles(transcriptPath));
   }
+}
+
+function gitRoot(): string {
+  try {
+    return execSync('git rev-parse --show-toplevel', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
+/** `docker compose run --rm test` with no `build` in the same chain. */
+function isDockerBareTestCommand(command: string): boolean {
+  return (
+    /docker\s+compose\s+run\s+--rm\s+test\b/.test(command) &&
+    !/docker\s+compose\s+build\b/.test(command)
+  );
+}
+
+/**
+ * Branch-guide law made mechanical: the bare test run reuses the cached
+ * source COPY layer and can green-light stale code. Deny once per command
+ * per session; an identical retry is a deliberate proceed (fast-lane runs
+ * between review rounds are legitimate).
+ */
+function dockerStaleTestGuard(
+  projectRoot: string,
+  sessionId: string,
+  command: string,
+): void {
+  if (!existsSync(join(projectRoot, 'docker-compose.yml'))) return;
+
+  const sig = createHash('sha1')
+    .update(sessionId + '\0' + command)
+    .digest('hex')
+    .slice(0, 16);
+  const marker = join(tmpdir(), 'lat-docker-nudge-' + sig);
+  if (existsSync(marker)) return;
+  if (!tryFire(sessionId, projectRoot, 'docker-guard', MAX_FIRES_PER_SESSION))
+    return;
+  try {
+    writeFileSync(marker, '');
+  } catch {
+    // Unwritable tmpdir: nudge again next time.
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          'Bare `docker compose run --rm test` reuses the cached source COPY layer and can green-light stale code. ' +
+          'For the final pre-push gate, chain `docker compose build && docker compose run --rm test`. ' +
+          'A fast-lane targeted run between review rounds is fine — re-run the same command to proceed as-is.',
+      },
+    }),
+  );
 }
 
 async function commitSyncGate(
@@ -666,20 +768,134 @@ async function pushChecks(
     }
   }
 
+  // Advisory parts merge into ONE message — separate surfaces, one poke.
+  const parts: string[] = [];
+
   const unpushed = run('git log @{upstream}..HEAD --oneline').trim();
-  if (unpushed && tryFire(sessionId, latDir, 'push-manifest', MAX_FIRES_PER_SESSION)) {
+  if (unpushed && tryFire(sessionId, latDir, 'push-manifest', MAX_FIRES_PER_SESSION, true)) {
+    parts.push(
+      'About to push these commits (shared tree — verify every one is yours):\n' +
+        unpushed,
+    );
+  }
+
+  if (unpushed) {
+    const outgoingFiles = run('git diff @{upstream}..HEAD --name-only');
+    const subjects = run('git log @{upstream}..HEAD --format=%s');
+    if (
+      /^src\//m.test(outgoingFiles) &&
+      !/two-lab fold/.test(subjects) &&
+      tryFire(sessionId, latDir, 'two-lab-reminder', 1, true)
+    ) {
+      parts.push(
+        'This stack touches src/ and carries no `two-lab fold:` commit — check the two-lab triggers (Tier-A/market-semantics, scored artifacts, guards/fail-closed machinery, topology, blocking fixes) before pushing. Tier-B mechanical stacks: proceed.',
+      );
+    }
+  }
+
+  if (parts.length) {
     // No permissionDecision: an 'allow' would silently bypass the user's
     // permission prompt for the push — context only, permission flow untouched.
-    process.stdout.write(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          additionalContext:
-            'About to push these commits (shared tree — verify every one is yours):\n' +
-            unpushed,
-        },
-      }),
+    outputClaudeContext('PreToolUse', parts.join('\n\n'));
+  }
+}
+
+type Trap = { name: string; re: RegExp; fix: string };
+
+/**
+ * Parse `<latDir>/traps.md` — the repo's executable incident table. Each
+ * `## trap: <name>` section carries a signature regex (backticked) and a fix
+ * line; every trap folded into the graph starts firing automatically when
+ * its error recurs. Malformed entries are skipped, never fatal.
+ */
+function loadTraps(latDir: string): Trap[] {
+  let raw: string;
+  try {
+    raw = readFileSync(join(latDir, 'traps.md'), 'utf-8');
+  } catch {
+    return [];
+  }
+  const traps: Trap[] = [];
+  for (const chunk of raw.split(/^## /m).slice(1)) {
+    const name = chunk.match(/^trap:\s*(\S+)/)?.[1];
+    const sig = chunk.match(/signature:\s*`([^`]+)`/)?.[1];
+    const fix = chunk.match(/fix:\s*(.+)/)?.[1];
+    if (!name || !sig || !fix) continue;
+    try {
+      traps.push({ name, re: new RegExp(sig, 'i'), fix: fix.trim() });
+    } catch {
+      // Invalid signature regex — skip the entry.
+    }
+  }
+  return traps;
+}
+
+/**
+ * PostToolUseFailure: match the failure against the repo's trap table and
+ * inject the known fix at the moment of recurrence. Corrective (answers an
+ * error the agent just hit) — outside the advisory pool; each trap speaks
+ * once per session.
+ */
+async function handleClaudePostToolUseFailure(): Promise<void> {
+  let sessionId = '';
+  let haystack = '';
+  try {
+    const raw = await readStdin();
+    const input = JSON.parse(raw);
+    if (typeof input.session_id === 'string') sessionId = input.session_id;
+    haystack = [
+      extractToolResponseText(input.tool_response),
+      typeof input.error === 'string' ? input.error : JSON.stringify(input.error ?? ''),
+      input.tool_input?.command ?? '',
+    ].join('\n');
+  } catch {
+    return;
+  }
+
+  const latDir = findLatticeDir();
+  if (!latDir) return;
+
+  for (const trap of loadTraps(latDir)) {
+    if (!trap.re.test(haystack)) continue;
+    if (!tryFire(sessionId, latDir, 'trap:' + trap.name, 1)) return;
+    outputClaudeContext(
+      'PostToolUseFailure',
+      `Known trap (${trap.name}): ${trap.fix}`,
     );
+    return;
+  }
+}
+
+/**
+ * WorktreeCreate: propagate the repo's untracked .claude/settings.json into
+ * the new worktree, so implementer subagents isolated there inherit the same
+ * hooks. Always exits 0 — a failed copy must never fail worktree creation.
+ */
+async function handleClaudeWorktreeCreate(): Promise<void> {
+  let worktreePath = '';
+  try {
+    const raw = await readStdin();
+    const input = JSON.parse(raw);
+    worktreePath =
+      [input.worktree_path, input.worktreePath, input.path].find(
+        (v: unknown) => typeof v === 'string',
+      ) ?? '';
+  } catch {
+    return;
+  }
+  if (!worktreePath) return;
+
+  const latDir = findLatticeDir();
+  const root = latDir ? dirname(latDir) : gitRoot();
+  if (!root) return;
+  const src = join(root, '.claude', 'settings.json');
+  const dst = join(worktreePath, '.claude', 'settings.json');
+  if (!existsSync(src) || existsSync(dst)) return;
+  try {
+    mkdirSync(join(worktreePath, '.claude'), { recursive: true });
+    copyFileSync(src, dst);
+  } catch {
+    // Never fail worktree creation over a settings copy.
   }
 }
 
@@ -726,7 +942,7 @@ async function handleClaudePostToolUse(): Promise<void> {
   // text — a far better search query than any user prompt. Falls back to the
   // static reminder when no index is available.
   if (/claim_item/.test(toolName) && responseText) {
-    if (!tryFire(sessionId, latDir, 'claim-search', MAX_FIRES_PER_SESSION))
+    if (!tryFire(sessionId, latDir, 'claim-search', MAX_FIRES_PER_SESSION, true))
       return;
     let searchContext: string | null = null;
     try {
@@ -749,7 +965,7 @@ async function handleClaudePostToolUse(): Promise<void> {
     }
   }
 
-  if (!tryFire(sessionId, latDir, 'work-start', 1)) return;
+  if (!tryFire(sessionId, latDir, 'work-start', 1, true)) return;
 
   outputClaudeContext(
     'PostToolUse',
@@ -788,9 +1004,15 @@ export async function hookCmd(agent: string, event: string): Promise<void> {
         case 'SessionStart':
           await handleClaudeSessionStart();
           return;
+        case 'PostToolUseFailure':
+          await handleClaudePostToolUseFailure();
+          return;
+        case 'WorktreeCreate':
+          await handleClaudeWorktreeCreate();
+          return;
         default:
           console.error(
-            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse, SessionStart`,
+            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse, PostToolUseFailure, SessionStart, WorktreeCreate`,
           );
           process.exit(1);
       }
