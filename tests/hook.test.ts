@@ -44,6 +44,28 @@ function makeFakeGitDir(output: string): string {
   return dir;
 }
 
+/**
+ * Write a fake Claude Code transcript (JSONL) whose assistant messages carry
+ * the given tool_use calls. Returns the transcript file path; the caller's
+ * temp dir owns cleanup.
+ */
+function makeTranscript(
+  dir: string,
+  calls: { name: string; file_path: string }[],
+): string {
+  const lines = calls.map((c) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [{ type: 'tool_use', name: c.name, input: { file_path: c.file_path } }],
+      },
+    }),
+  );
+  const path = join(dir, 'transcript.jsonl');
+  writeFileSync(path, lines.join('\n') + '\n');
+  return path;
+}
+
 /** Run `lat hook <agent> <event>` against a test case dir. */
 function runHook(
   agent: string,
@@ -52,10 +74,12 @@ function runHook(
   opts: {
     stopHookActive?: boolean;
     fakeBinDir?: string;
+    transcriptPath?: string;
   } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
   const stdinJson = JSON.stringify({
     stop_hook_active: opts.stopHookActive ?? false,
+    ...(opts.transcriptPath ? { transcript_path: opts.transcriptPath } : {}),
   });
 
   const env: Record<string, string> = {
@@ -91,6 +115,7 @@ function runStopHook(
   opts: {
     stopHookActive?: boolean;
     fakeBinDir?: string;
+    transcriptPath?: string;
   } = {},
 ): { stdout: string; stderr: string; exitCode: number } {
   return runHook(agent, agent === 'claude' ? 'Stop' : 'stop', caseDir, opts);
@@ -132,6 +157,66 @@ describe('hook stop', () => {
       expect(parsed.decision).toBe('block');
       expect(parsed.reason).toContain('110');
       expect(parsed.reason).toContain('lat.md/');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Session attribution suppresses another session's diff]]
+  it('exits silently when the dirty code was not edited by this session', () => {
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[80, 30, 'src/big-refactor.ts']]),
+    );
+    try {
+      // This session only READ the dirty file and edited something outside
+      // the counted diff — a bystander on a shared tree.
+      const transcriptPath = makeTranscript(fakeBinDir, [
+        { name: 'Read', file_path: 'C:\\repo\\src\\big-refactor.ts' },
+        { name: 'Edit', file_path: 'C:\\elsewhere\\notes.md' },
+      ]);
+      const { stdout } = runStopHook('claude', clean, {
+        fakeBinDir,
+        transcriptPath,
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Session attribution still nags the session that edited]]
+  it('blocks when this session edited the dirty code', () => {
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[80, 30, 'src/big-refactor.ts']]),
+    );
+    try {
+      const transcriptPath = makeTranscript(fakeBinDir, [
+        { name: 'Edit', file_path: 'C:\\repo\\src\\big-refactor.ts' },
+      ]);
+      const { stdout } = runStopHook('claude', clean, {
+        fakeBinDir,
+        transcriptPath,
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.decision).toBe('block');
+      expect(parsed.reason).toContain('lat.md/');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
+  // @lat: [[tests/hook#Unreadable transcript disables attribution]]
+  it('blocks unfiltered when the transcript path cannot be read', () => {
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[80, 30, 'src/big-refactor.ts']]),
+    );
+    try {
+      const { stdout } = runStopHook('claude', clean, {
+        fakeBinDir,
+        transcriptPath: join(fakeBinDir, 'no-such-transcript.jsonl'),
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.decision).toBe('block');
     } finally {
       rmDirBestEffort(fakeBinDir);
     }

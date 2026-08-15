@@ -20,6 +20,28 @@ When `lat check` finds errors, the hook outputs a block decision with a reason m
 
 When check passes but `git diff --numstat` shows code changes above the threshold with no `lat.md/` changes, the hook blocks with a reminder to update `lat.md/`.
 
+## Session attribution suppresses another session's diff
+
+With a `transcript_path` on stdin, only files this session edited count toward
+the sync tally — a bystander on a shared working tree exits silently.
+
+Edited means write-tool calls in the transcript (Edit, Write, MultiEdit,
+NotebookEdit); a session that merely read a dirty file, or edited files
+outside the counted diff, is not nagged for another session's diff.
+
+## Session attribution still nags the session that edited
+
+With a transcript whose Edit call matches a dirty source file (absolute
+transcript path matched by suffix against the repo-relative numstat path,
+case-insensitive, both slash styles), the hook still blocks — the sync debt
+follows authorship.
+
+## Unreadable transcript disables attribution
+
+When `transcript_path` is missing or unreadable, attribution is disabled and
+the hook falls back to the unfiltered tally, preserving the pre-attribution
+behavior for callers that pass no transcript.
+
 ## Exits silently when lat.md/ changes are proportional
 
 When code changes are large but `lat.md/` changes exceed the 5% ratio, the hook exits silently.

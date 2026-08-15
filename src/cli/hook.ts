@@ -1,4 +1,5 @@
 import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, extname } from 'node:path';
 import { findLatticeDir } from '../lattice.js';
 import { plainStyler, type CmdContext } from '../context.js';
@@ -163,23 +164,24 @@ const LATMD_RATIO = 0.05;
 /** If lat.md/ changes exceed this many lines, skip the ratio check entirely. */
 const LATMD_UPPER_THRESHOLD = 50;
 
-/** Run `git diff --numstat` and return { codeLines, latMdLines }. */
-function analyzeDiff(projectRoot: string): {
-  codeLines: number;
-  latMdLines: number;
-} {
+type DiffEntry = { file: string; changed: number; isLat: boolean };
+
+/** Run `git diff HEAD --numstat` and return one entry per counted file. */
+function analyzeDiff(projectRoot: string): DiffEntry[] {
   let output: string;
   try {
+    // stderr ignored: git emits advisory warnings (e.g. CRLF conversion) that
+    // would otherwise leak into the agent-facing hook stderr.
     output = execSync('git diff HEAD --numstat', {
       cwd: projectRoot,
       encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch {
-    return { codeLines: 0, latMdLines: 0 };
+    return [];
   }
 
-  let codeLines = 0;
-  let latMdLines = 0;
+  const entries: DiffEntry[] = [];
 
   // Each line: "added\tremoved\tfile" (e.g. "42\t11\tsrc/cli/hook.ts")
   for (const line of output.split('\n')) {
@@ -188,14 +190,89 @@ function analyzeDiff(projectRoot: string): {
     const added = parseInt(parts[0], 10) || 0;
     const removed = parseInt(parts[1], 10) || 0;
     const file = parts[2];
-    const changed = added + removed;
     if (file.startsWith('lat.md/')) {
-      latMdLines += changed;
+      entries.push({ file, changed: added + removed, isLat: true });
     } else if (SOURCE_EXTENSIONS.has(extname(file))) {
-      codeLines += changed;
+      entries.push({ file, changed: added + removed, isLat: false });
     }
   }
 
+  return entries;
+}
+
+function normPath(p: string): string {
+  return p.replace(/\\/g, '/').toLowerCase();
+}
+
+function touchedHas(touched: Set<string>, repoRelFile: string): boolean {
+  const rel = normPath(repoRelFile);
+  for (const t of touched) {
+    if (t === rel || t.endsWith('/' + rel)) return true;
+  }
+  return false;
+}
+
+/** Tool names whose file_path input means the session WROTE that file. */
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/**
+ * Files this session edited, from its transcript (write-tool calls only —
+ * a Read of someone else's dirty file is not authorship). Returns null when
+ * no transcript is available, which disables attribution and preserves the
+ * unfiltered nag. Heuristic: edits made through shell commands are invisible
+ * here and simply don't count toward the session's sync debt.
+ */
+function sessionTouchedFiles(
+  transcriptPath: string | undefined,
+): Set<string> | null {
+  if (!transcriptPath) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const out = new Set<string>();
+  for (const line of raw.split('\n')) {
+    if (!line.includes('"tool_use"')) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const content = (obj as { message?: { content?: unknown } })?.message
+      ?.content;
+    if (!Array.isArray(content)) continue;
+    for (const item of content) {
+      if (
+        item?.type === 'tool_use' &&
+        WRITE_TOOLS.has(item?.name) &&
+        typeof item?.input?.file_path === 'string'
+      ) {
+        out.add(normPath(item.input.file_path));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Tally diff lines, restricted to files this session edited when a transcript
+ * is available (touched !== null). On a shared working tree another session's
+ * in-flight diff must not nag this one — the sync debt follows authorship.
+ */
+function tallyDiff(
+  entries: DiffEntry[],
+  touched: Set<string> | null,
+): { codeLines: number; latMdLines: number } {
+  let codeLines = 0;
+  let latMdLines = 0;
+  for (const e of entries) {
+    if (touched !== null && !touchedHas(touched, e.file)) continue;
+    if (e.isLat) latMdLines += e.changed;
+    else codeLines += e.changed;
+  }
   return { codeLines, latMdLines };
 }
 
@@ -207,7 +284,10 @@ type StopStatus = {
   latMdLines: number;
 };
 
-async function getStopStatus(latDir: string): Promise<StopStatus> {
+async function getStopStatus(
+  latDir: string,
+  touched: Set<string> | null = null,
+): Promise<StopStatus> {
   const md = await checkMd(latDir);
   const code = await checkCodeRefs(latDir);
   const indexErrors = await checkIndex(latDir);
@@ -220,7 +300,7 @@ async function getStopStatus(latDir: string): Promise<StopStatus> {
   const checkFailed = totalErrors > 0;
 
   const projectRoot = dirname(latDir);
-  const { codeLines, latMdLines } = analyzeDiff(projectRoot);
+  const { codeLines, latMdLines } = tallyDiff(analyzeDiff(projectRoot), touched);
   let needsSync = false;
   if (codeLines >= DIFF_THRESHOLD && latMdLines < LATMD_UPPER_THRESHOLD) {
     const effectiveLatMd = latMdLines === 0 ? 0 : Math.max(latMdLines, 1);
@@ -285,17 +365,21 @@ async function handleClaudeStop(): Promise<void> {
   const latDir = findLatticeDir();
   if (!latDir) return;
 
-  // Read stdin to check if we already blocked once
+  // Read stdin: stop_hook_active (already blocked once) and transcript_path
+  // (session attribution — only this session's edits count toward sync debt).
   let stopHookActive = false;
+  let transcriptPath: string | undefined;
   try {
     const raw = await readStdin();
     const input = JSON.parse(raw);
     stopHookActive = input.stop_hook_active ?? false;
+    if (typeof input.transcript_path === 'string')
+      transcriptPath = input.transcript_path;
   } catch {
     // If we can't parse stdin, treat as first attempt
   }
 
-  const status = await getStopStatus(latDir);
+  const status = await getStopStatus(latDir, sessionTouchedFiles(transcriptPath));
 
   // Second pass — warn the user but don't block again
   if (stopHookActive) {
