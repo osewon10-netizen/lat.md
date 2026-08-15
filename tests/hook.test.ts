@@ -300,6 +300,28 @@ describe('hook pre-tool-use (push checks)', () => {
     }
   });
 
+  // @lat: [[tests/hook#Push fold check respects session attribution]]
+  it('does not deny a push over another session\'s dirty lat.md', () => {
+    const fakeBinDir = makeFakeGitDir(numstat([[5, 1, 'lat.md/topic.md']]));
+    try {
+      const transcriptPath = makeTranscript(fakeBinDir, [
+        { name: 'Edit', file_path: 'C:\\repo\\src\\mine.ts' },
+      ]);
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git push',
+        transcriptPath,
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.permissionDecision).toBeUndefined();
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+
   // @lat: [[tests/hook#Push checks stay silent on a clean tree]]
   it('stays silent when nothing is stranded and nothing is unpushed', () => {
     const fakeBinDir = makeFakeGitDir('');

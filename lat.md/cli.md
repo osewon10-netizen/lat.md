@@ -286,9 +286,11 @@ Every hook surface obeys a HARD CEILING of two firings per session
 2026-08-15 operator rule) — repeated hook text is context an agent pays for
 on every subsequent request. Push specifics: uncommitted `lat.md/` changes
 at push time (a fold written but not committed) deny once and yield on
-retry; the manifest (`git log @{upstream}..HEAD --oneline`) is injected as
-advisory `additionalContext` with NO permission decision — an `allow` would
-silently bypass the user's permission prompt for the push.
+retry — filtered by the same transcript attribution as the Stop hook, so
+another session's dirty topics on a shared tree never trigger it; the
+manifest (`git log @{upstream}..HEAD --oneline`) is injected as advisory
+`additionalContext` with NO permission decision — an `allow` would silently
+bypass the user's permission prompt for the push.
 
 The staged diff (`git diff --cached --numstat`) is what the imminent commit
 actually ships, so co-tenant working-tree noise is structurally excluded and

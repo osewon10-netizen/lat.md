@@ -486,12 +486,15 @@ async function handleClaudePreToolUse(): Promise<void> {
   let sessionId = '';
   let toolName = '';
   let command = '';
+  let transcriptPath: string | undefined;
   try {
     const raw = await readStdin();
     const input = JSON.parse(raw);
     if (typeof input.session_id === 'string') sessionId = input.session_id;
     toolName = input.tool_name ?? '';
     command = input.tool_input?.command ?? '';
+    if (typeof input.transcript_path === 'string')
+      transcriptPath = input.transcript_path;
   } catch {
     return;
   }
@@ -503,7 +506,7 @@ async function handleClaudePreToolUse(): Promise<void> {
   if (isGitCommitCommand(command)) {
     await commitSyncGate(latDir, sessionId);
   } else if (isGitPushCommand(command)) {
-    await pushChecks(latDir, sessionId);
+    await pushChecks(latDir, sessionId, sessionTouchedFiles(transcriptPath));
   }
 }
 
@@ -568,7 +571,11 @@ function isGitPushCommand(command: string): boolean {
  * ship on a shared tree (advisory allow; ignored harmlessly by harnesses
  * without PreToolUse additionalContext support).
  */
-async function pushChecks(latDir: string, sessionId: string): Promise<void> {
+async function pushChecks(
+  latDir: string,
+  sessionId: string,
+  touched: Set<string> | null,
+): Promise<void> {
   const root = dirname(latDir);
   const run = (cmd: string): string => {
     try {
@@ -582,7 +589,17 @@ async function pushChecks(latDir: string, sessionId: string): Promise<void> {
     }
   };
 
-  const stranded = run('git status --porcelain -- lat.md/').trim();
+  // Same authorship rule as the Stop hook: on a shared tree, another
+  // session's dirty lat.md topics are not this session's stranded fold.
+  const stranded = run('git status --porcelain -- lat.md/')
+    .split('\n')
+    .filter((line) => {
+      const file = line.slice(3).split(' -> ').pop()?.trim() ?? '';
+      if (!file) return false;
+      return touched === null || touchedHas(touched, file);
+    })
+    .join('\n')
+    .trim();
   if (stranded) {
     const sig = createHash('sha1')
       .update(sessionId + '\0' + stranded)

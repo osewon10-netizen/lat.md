@@ -63,6 +63,12 @@ A push with uncommitted `lat.md/` changes is denied once with the
 fold-lands-before-the-push reminder; the retry gets the unpushed-commit
 manifest as advisory context, and after the budget, silence.
 
+## Push fold check respects session attribution
+
+Dirty `lat.md/` files this session never edited (another session's in-flight
+fold on a shared tree) do not trigger the stranded-fold deny; the manifest
+still arrives as advisory context.
+
 ## Push checks stay silent on a clean tree
 
 With nothing stranded and nothing unpushed, a push produces no hook output.
