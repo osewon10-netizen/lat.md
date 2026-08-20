@@ -135,6 +135,13 @@ const SEARCH_CONTEXT_BUDGET = 8000;
 const MAX_FIRES_PER_SESSION = 2;
 
 /**
+ * Scan budget for a gate, well under the CLI's. Hooks run synchronously in
+ * front of a tool call, so an over-budget scan is felt as the agent hanging;
+ * degrading to wiki-link evidence alone is the cheaper failure.
+ */
+const GATE_SCAN_TIMEOUT_MS = 3_000;
+
+/**
  * ADVISORY surfaces (orientation, reminders, manifests) additionally share
  * one session-wide pool, so the sum of pokes stays bounded no matter how many
  * surfaces exist. Corrective output — deny gates that fire only on real debt,
@@ -874,6 +881,10 @@ function sessionSourceFiles(
  * INSIDE it naming their spec. One sweep over the graph — findRefs() reloads
  * every section and rescans the tree per query, which a gate sitting in front
  * of a tool call cannot afford.
+ *
+ * The one tree scan it does keep runs on a tighter budget than the CLI's: a
+ * gate that stalls the tool call it fronts is worse than a gate that degrades
+ * to wiki links alone, which is what a skipped scan leaves it with.
  */
 async function documentingSections(
   latDir: string,
@@ -912,7 +923,9 @@ async function documentingSections(
   }
 
   try {
-    const { refs } = await scanCodeRefs(projectRoot);
+    const { refs } = await scanCodeRefs(projectRoot, {
+      timeoutMs: GATE_SCAN_TIMEOUT_MS,
+    });
     for (const ref of refs) {
       if (targets.includes(normPath(ref.file))) add(ref.target, 'its spec');
     }

@@ -13,7 +13,7 @@ import {
   type SectionMatch,
 } from '../lattice.js';
 import { formatResultList } from '../format.js';
-import { scanCodeRefs } from '../code-refs.js';
+import { scanCodeRefs, type ScanSkip } from '../code-refs.js';
 import type { CmdContext, CmdResult } from '../context.js';
 
 export type Scope = 'md' | 'code' | 'md+code';
@@ -23,6 +23,9 @@ export type RefsFound = {
   target: Section;
   mdRefs: SectionMatch[];
   codeRefs: string[];
+  /** Set when the code half of the query never ran, so an empty `codeRefs`
+   *  means "not looked for", not "none exist". */
+  codeScanSkipped?: ScanSkip;
 };
 
 export type RefsError = {
@@ -31,6 +34,12 @@ export type RefsError = {
 };
 
 export type RefsResult = RefsFound | RefsError;
+
+/** A skipped scan never looked, so its empty result is not evidence. Say so
+ *  wherever code refs are reported, or absence reads as proof of absence. */
+function scanSkipNote(skip: ScanSkip): string {
+  return `code refs not scanned (${skip.reason}: ${skip.message}) — run \`lat check code-refs\` for the fix`;
+}
 
 /** Extensions recognized as source code for ref queries. */
 const SOURCE_EXTS = new Set([
@@ -152,8 +161,10 @@ async function findSourceRefs(
     }
   }
 
+  let codeScanSkipped: ScanSkip | undefined;
   if (scope === 'code' || scope === 'md+code') {
-    const { refs: scannedRefs } = await scanCodeRefs(projectRoot);
+    const { refs: scannedRefs, skipped } = await scanCodeRefs(projectRoot);
+    codeScanSkipped = skipped;
     for (const ref of scannedRefs) {
       const targetLower = ref.target.toLowerCase();
       const matches = isFileLevel
@@ -169,7 +180,7 @@ async function findSourceRefs(
     }
   }
 
-  return { kind: 'found', target, mdRefs, codeRefs };
+  return { kind: 'found', target, mdRefs, codeRefs, codeScanSkipped };
 }
 
 /**
@@ -249,8 +260,10 @@ export async function findRefs(
     }
   }
 
+  let codeScanSkipped: ScanSkip | undefined;
   if (scope === 'code' || scope === 'md+code') {
-    const { refs: scannedRefs } = await scanCodeRefs(ctx.projectRoot);
+    const { refs: scannedRefs, skipped } = await scanCodeRefs(ctx.projectRoot);
+    codeScanSkipped = skipped;
     for (const ref of scannedRefs) {
       const { resolved: codeResolved } = resolveRef(
         ref.target,
@@ -267,7 +280,13 @@ export async function findRefs(
     }
   }
 
-  return { kind: 'found', target: exactMatch, mdRefs, codeRefs };
+  return {
+    kind: 'found',
+    target: exactMatch,
+    mdRefs,
+    codeRefs,
+    codeScanSkipped,
+  };
 }
 
 export async function refsCommand(
@@ -300,17 +319,25 @@ export async function refsCommand(
     };
   }
 
-  const { target, mdRefs, codeRefs } = result;
+  const { target, mdRefs, codeRefs, codeScanSkipped } = result;
 
   if (mdRefs.length === 0 && codeRefs.length === 0) {
     return {
-      output: ctx.styler.yellow(`No references to "${target.id}" found`),
+      output: ctx.styler.yellow(
+        `No references to "${target.id}" found` +
+          (codeScanSkipped
+            ? ` in lat.md/ — ${scanSkipNote(codeScanSkipped)}`
+            : ''),
+      ),
       isError: true,
     };
   }
 
   const s = ctx.styler;
   const parts: string[] = [];
+  if (codeScanSkipped) {
+    parts.push(s.yellow('Note: ') + scanSkipNote(codeScanSkipped));
+  }
   if (mdRefs.length > 0) {
     parts.push(formatResultList(ctx, `References to "${target.id}":`, mdRefs));
   }

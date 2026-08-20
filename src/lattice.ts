@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join, basename, relative, resolve } from 'node:path';
 import { existsSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { parse } from './parser.js';
 import { toPosix, walkEntries } from './walk.js';
 import { visit } from 'unist-util-visit';
@@ -41,9 +42,20 @@ export function parseFrontmatter(content: string): LatFrontmatter {
   return result;
 }
 
+/**
+ * Walk up for the nearest `lat.md/`, stopping at the user's home directory.
+ *
+ * The upward walk is unbounded by design — a lat root sits at a repository
+ * root, which may be several levels above cwd. Home is where that stops being
+ * true: a `lat.md/` at or above `$HOME` makes every command anywhere under it
+ * resolve a project root spanning the whole account, and the code-ref scan
+ * then walks it. Nobody adopts a graph at `$HOME`; treat it as not found.
+ */
 export function findLatticeDir(from?: string): string | null {
+  const home = resolve(homedir());
   let dir = resolve(from ?? process.cwd());
   while (true) {
+    if (dir === home) return null;
     const candidate = join(dir, 'lat.md');
     if (existsSync(candidate) && statSync(candidate).isDirectory()) {
       return candidate;

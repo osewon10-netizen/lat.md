@@ -11,7 +11,7 @@ import {
   type Section,
   type SectionMatch,
 } from '../lattice.js';
-import { scanCodeRefs } from '../code-refs.js';
+import { scanCodeRefs, type ScanSkip } from '../code-refs.js';
 import { SOURCE_EXTENSIONS, resolveSourceSymbol } from '../source-parser.js';
 import type { CmdContext, CmdResult } from '../context.js';
 import { formatSectionId, formatNavHints } from '../format.js';
@@ -38,6 +38,9 @@ export type SectionFound = {
   outgoingSourceRefs: SourceRef[];
   incomingRefs: SectionMatch[];
   codeRefs: CodeBackRef[];
+  /** Set when the tree was never scanned, so an empty `codeRefs` means "not
+   *  looked for" rather than "nothing points here". */
+  codeScanSkipped?: ScanSkip;
 };
 
 export type SectionResult =
@@ -187,7 +190,9 @@ export async function getSection(
 
   // Find code back-references: @lat: comments pointing to this section
   const codeRefs: CodeBackRef[] = [];
-  const { refs: scannedRefs } = await scanCodeRefs(ctx.projectRoot);
+  const { refs: scannedRefs, skipped: codeScanSkipped } = await scanCodeRefs(
+    ctx.projectRoot,
+  );
   for (const ref of scannedRefs) {
     const { resolved: codeResolved } = resolveRef(
       ref.target,
@@ -218,6 +223,7 @@ export async function getSection(
     outgoingSourceRefs,
     incomingRefs,
     codeRefs,
+    codeScanSkipped,
   };
 }
 
@@ -245,6 +251,7 @@ export function formatSectionOutput(
     outgoingSourceRefs,
     incomingRefs,
     codeRefs,
+    codeScanSkipped,
   } = result;
   const relPath = relative(
     process.cwd(),
@@ -299,6 +306,15 @@ export function formatSectionOutput(
         `${s.dim('*')} [[${formatSectionId(ref.section.id, s)}]]${body}`,
       );
     }
+  }
+
+  if (codeScanSkipped) {
+    parts.push(
+      '',
+      s.yellow('Note:') +
+        ` code back-references not scanned (${codeScanSkipped.reason}: ${codeScanSkipped.message}) —` +
+        ' run `lat check code-refs` for the fix.',
+    );
   }
 
   if (codeRefs.length > 0) {

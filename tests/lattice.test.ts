@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   findLatticeDir,
@@ -8,6 +10,7 @@ import {
   resolveRef,
 } from '../src/lattice.js';
 import { toPosix } from '../src/walk.js';
+import { rmDirBestEffort } from './util.js';
 
 const basicDir = join(import.meta.dirname, 'cases', 'basic-project');
 const basicLat = join(basicDir, 'lat.md');
@@ -19,6 +22,34 @@ describe('findLatticeDir', () => {
 
   it('returns null when no .lat exists', () => {
     expect(findLatticeDir('/')).toBeNull();
+  });
+
+  // The upward walk is unbounded so a lat root can sit several levels above
+  // cwd, but a `lat.md/` at or above $HOME would make every command anywhere
+  // under it resolve a project root spanning the whole account — and the
+  // code-ref scan then walks it. Home is where the walk stops.
+  it('stops at the home directory rather than adopting a root above the repo', () => {
+    const home = mkdtempSync(join(tmpdir(), 'lat-home-'));
+    const prevHome = process.env.HOME;
+    const prevProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      mkdirSync(join(home, 'lat.md'));
+      const child = join(home, 'server', 'some', 'repo');
+      mkdirSync(child, { recursive: true });
+
+      expect(findLatticeDir(home)).toBeNull();
+      expect(findLatticeDir(child)).toBeNull();
+
+      // A graph below home still resolves normally.
+      mkdirSync(join(home, 'server', 'some', 'repo', 'lat.md'));
+      expect(findLatticeDir(child)).toBe(join(child, 'lat.md'));
+    } finally {
+      process.env.HOME = prevHome;
+      process.env.USERPROFILE = prevProfile;
+      rmDirBestEffort(home);
+    }
   });
 });
 

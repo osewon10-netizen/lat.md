@@ -43,9 +43,19 @@ All directory walking goes through [[src/walk.ts#walkEntries]], the single entry
 
 It wraps the `ignore-walk` npm package to ensure `.gitignore` rules are consistently honored everywhere. Results are not cached — each call re-walks the filesystem, which is necessary for long-lived processes like the MCP server.
 
-[[src/code-refs.ts#walkFiles]] calls `walkEntries()` then additionally skips `.md` files, `lat.md/`, `.claude/`, and sub-projects (directories containing their own `lat.md/`).
+[[src/code-refs.ts#walkFiles]] calls `walkEntries()` then applies `isExcluded()`, the shared predicate that skips `.md` files, `lat.md/`, `.claude/`, and sub-projects (directories containing their own `lat.md/`). The same predicate filters rg's output, so the file list a scan reports is the set it actually searched, whichever path ran.
 
-[[src/code-refs.ts#scanCodeRefs]] uses a two-tier strategy for finding `@lat:` comments: it first tries `rg` (ripgrep), falling back to a pure TypeScript implementation. When rg is available, it handles both searching and file listing — `walkFiles` is not called. Exclusions for `lat.md/`, `.claude/`, `*.md`, and sub-projects are passed as `--glob` args to rg. Sub-projects are detected upfront via `rg --files` (directories containing a nested `lat.md/`). The TS fallback uses `walkFiles` for both file discovery and exclusion filtering. `CodeRef.file` is always stored as a projectRoot-relative path; consumers convert to cwd-relative only at display time. Setting `_LAT_DISABLE_RG=1` forces the TS fallback; used in tests to cover both paths.
+[[src/code-refs.ts#scanCodeRefs]] uses a two-tier strategy for finding `@lat:` comments: it first tries `rg` (ripgrep), falling back to a pure TypeScript implementation. The rg path is **two passes, not three** — one `rg --files` supplies both the sub-project list and the in-scope file list, then one content pass reads bytes. Both pass `--no-require-git`, because rg otherwise ignores `.gitignore` outright whenever the scan root is not itself inside a git repository, and the content pass caps `--max-filesize` so one stray log or model blob cannot dominate it. Exclusions for `lat.md/`, `.claude/`, `*.md`, and sub-projects are `--glob` args. `CodeRef.file` is always stored as a projectRoot-relative path; consumers convert to cwd-relative only at display time. Setting `_LAT_DISABLE_RG=1` forces the TS fallback; used in tests to cover both paths.
+
+### Scan Bounds
+
+A scan is bounded work, and its cost is set by where the lat root sits — [[src/lattice.ts#findLatticeDir]] walks up for the nearest `lat.md/`, so the root is whatever ancestor holds one and the scan walks everything beneath it.
+
+Three bounds keep that from becoming unbounded. Each rg subprocess runs under a wall-clock budget (`DEFAULT_SCAN_TIMEOUT_MS`; a hook gate passes a much tighter one, since it blocks the tool call it fronts). A tree over `MAX_SCAN_FILES` is refused outright — at that size it is not a project but a home or state directory. And the upward walk stops at `$HOME`, so a stray `lat.md/` there cannot capture every command run under the account.
+
+When a bound trips the scan returns `skipped` and no refs. **`refs: []` with `skipped` set means "never looked", not "found nothing"** — so [[cli#check#code-refs]] reports the skip and validates nothing rather than passing vacuously (and failing every `require-code-mention` section on absent evidence), and `lat refs` / `lat section` label their empty code half instead of presenting it as absence.
+
+Only a *missing* rg falls back to the TS walk. A timed-out or failed scan must not be retried by the slower path over the same tree — that converts a bounded subprocess into an unbounded in-process one. The same rule is why `rg` exit code 1 is read as "no matches, successfully" rather than as failure: treating it as an error sent every ref-free tree down the fallback, the one case rg had already settled.
 
 [[src/cli/check.ts#checkIndex]] calls `walkEntries()` on the `lat.md/` directory itself to discover visible entries for index validation.
 

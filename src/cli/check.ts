@@ -12,7 +12,7 @@ import {
   resolveRef,
   type Section,
 } from '../lattice.js';
-import { scanCodeRefs } from '../code-refs.js';
+import { scanCodeRefs, type ScanSkip } from '../code-refs.js';
 import { SOURCE_EXTENSIONS, clearSymbolCache } from '../source-parser.js';
 import { walkEntries } from '../walk.js';
 import type { CmdContext, CmdResult, Styler } from '../context.js';
@@ -65,6 +65,9 @@ export type FileStats = Record<string, number>;
 export type CheckResult = {
   errors: CheckError[];
   files: FileStats;
+  /** Set when the code-ref scan bailed out rather than reading the tree, so
+   *  an empty error list means "not checked", not "clean". */
+  skipped?: ScanSkip;
 };
 
 function countByExt(paths: string[]): FileStats {
@@ -183,15 +186,27 @@ export async function checkMd(latticeDir: string): Promise<CheckResult> {
   return { errors, files: countByExt(files) };
 }
 
-export async function checkCodeRefs(latticeDir: string): Promise<CheckResult> {
+export async function checkCodeRefs(
+  latticeDir: string,
+  /** Forwarded to the scanner; the file ceiling is the only knob a caller
+   *  (or a test) has reason to move. */
+  scanOpts: { timeoutMs?: number; maxFiles?: number } = {},
+): Promise<CheckResult> {
   const projectRoot = dirname(latticeDir);
   const allSections = await loadAllSections(latticeDir);
   const flat = flattenSections(allSections);
   const sectionIds = new Set(flat.map((s) => s.id.toLowerCase()));
   const fileIndex = buildFileIndex(allSections);
 
-  const scan = await scanCodeRefs(projectRoot);
+  const scan = await scanCodeRefs(projectRoot, scanOpts);
   const errors: CheckError[] = [];
+
+  // A skipped scan read nothing, so every ref check below would be asserting
+  // against an empty result set — dangling-ref checks vacuously pass and
+  // require-code-mention fails everything. Report the skip and check nothing.
+  if (scan.skipped) {
+    return { errors, files: countByExt(scan.files), skipped: scan.skipped };
+  }
 
   const mentionedSections = new Set<string>();
   for (const ref of scan.refs) {
@@ -481,12 +496,37 @@ function formatErrorCount(count: number, s: Styler): string {
   return s.red(`\n${count} error${count === 1 ? '' : 's'} found`);
 }
 
+/**
+ * A skipped scan is stated, never rolled into a pass. Each reason has exactly
+ * one fix, and it is almost always the same one: the lat root is above the
+ * repository it should sit at.
+ */
+function formatScanSkip(skip: ScanSkip, s: Styler): string[] {
+  const advice =
+    skip.reason === 'scan-failed'
+      ? 'Re-run to see the underlying error; ripgrep reported it on stderr.'
+      : 'A lat root belongs at a repository root. Check that `lat.md/` was not adopted above one — a home or node state directory pulls backups, logs, and mounted trees into the scan — and that build output and data are gitignored.';
+  return [
+    '',
+    s.yellow('Warning:') +
+      ' code refs not scanned (' +
+      skip.reason +
+      ') — ' +
+      skip.message +
+      '.',
+    s.dim('  ' + advice),
+  ];
+}
+
 // --- Unified command functions ---
 
-export async function checkAllCommand(ctx: CmdContext): Promise<CmdResult> {
+export async function checkAllCommand(
+  ctx: CmdContext,
+  scanOpts: { timeoutMs?: number; maxFiles?: number } = {},
+): Promise<CmdResult> {
   const startTime = Date.now();
   const md = await checkMd(ctx.latDir);
-  const code = await checkCodeRefs(ctx.latDir);
+  const code = await checkCodeRefs(ctx.latDir, scanOpts);
   const indexErrors = await checkIndex(ctx.latDir);
   const sectionErrors = await checkSections(ctx.latDir);
   const elapsed = Date.now() - startTime;
@@ -528,6 +568,8 @@ export async function checkAllCommand(ctx: CmdContext): Promise<CmdResult> {
     );
   }
 
+  if (code.skipped) lines.push(...formatScanSkip(code.skipped, s));
+
   lines.push(...formatCheckErrors(allErrors, s));
   lines.push(...formatCheckIndexErrors(indexErrors, s));
   lines.push(...formatCheckErrors(sectionErrors, s));
@@ -539,7 +581,11 @@ export async function checkAllCommand(ctx: CmdContext): Promise<CmdResult> {
     return { output: lines.join('\n'), isError: true };
   }
 
-  lines.push(s.green('All checks passed'));
+  lines.push(
+    code.skipped
+      ? s.yellow('Checks passed, except code refs (not scanned)')
+      : s.green('All checks passed'),
+  );
 
   // Suggest ripgrep if check was slow (>1s) and rg is not available
   if (elapsed > 1000) {
@@ -576,10 +622,13 @@ export async function checkMdCommand(ctx: CmdContext): Promise<CmdResult> {
 
 export async function checkCodeRefsCommand(
   ctx: CmdContext,
+  scanOpts: { timeoutMs?: number; maxFiles?: number } = {},
 ): Promise<CmdResult> {
-  const { errors, files } = await checkCodeRefs(ctx.latDir);
+  const { errors, files, skipped } = await checkCodeRefs(ctx.latDir, scanOpts);
   const s = ctx.styler;
   const lines: string[] = [formatFileStats(files, s)];
+
+  if (skipped) lines.push(...formatScanSkip(skipped, s));
 
   lines.push(...formatCheckErrors(errors, s));
 
@@ -588,7 +637,11 @@ export async function checkCodeRefsCommand(
     return { output: lines.join('\n'), isError: true };
   }
 
-  lines.push(s.green('code-refs: All references OK'));
+  lines.push(
+    skipped
+      ? s.yellow('code-refs: not scanned')
+      : s.green('code-refs: All references OK'),
+  );
   return { output: lines.join('\n') };
 }
 

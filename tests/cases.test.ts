@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execSync } from 'child_process';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   findLatticeDir,
@@ -16,13 +18,15 @@ import { formatSectionPreview } from '../src/format.js';
 import { plainStyler, type CmdContext } from '../src/context.js';
 import {
   checkMd,
+  checkAllCommand,
   checkCodeRefs,
   checkIndex,
   checkSections,
 } from '../src/cli/check.js';
-import { scanCodeRefs } from '../src/code-refs.js';
+import { hasRipgrep, scanCodeRefs } from '../src/code-refs.js';
 import { findRefs } from '../src/cli/refs.js';
 import { getSection, formatSectionOutput } from '../src/cli/section.js';
+import { rmDirBestEffort } from './util.js';
 
 // eslint-disable-next-line no-control-regex
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -435,6 +439,65 @@ describe('gitignore-filtering', () => {
   it('reports no errors when gitignored refs are excluded', async () => {
     const { errors } = await checkCodeRefs(latDir('gitignore-filtering'));
     expect(errors).toHaveLength(0);
+  });
+});
+
+// --- scan bounds ---
+
+describe('code-ref scan bounds', () => {
+  // Regression: rg exits 1 for "no matches", which the exec wrapper read as a
+  // failure and answered by re-reading the whole tree in-process. Every
+  // ref-free tree took the slow path — the one case rg had already settled.
+  it('stays on ripgrep in a tree that carries no @lat refs', async () => {
+    if (!(await hasRipgrep())) return;
+    const dir = mkdtempSync(join(tmpdir(), 'lat-norefs-'));
+    try {
+      mkdirSync(join(dir, 'src'));
+      writeFileSync(join(dir, 'src', 'a.ts'), 'export const a = 1;\n');
+      const scan = await scanCodeRefs(dir);
+      expect(scan.refs).toHaveLength(0);
+      expect(scan.usedRg).toBe(true);
+      expect(scan.skipped).toBeUndefined();
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  it('skips the scan instead of walking a tree over the file ceiling', async () => {
+    const scan = await scanCodeRefs(caseDir('python-code-ref'), {
+      maxFiles: 0,
+    });
+    expect(scan.skipped?.reason).toBe('too-many-files');
+    expect(scan.refs).toHaveLength(0);
+  });
+
+  // A skipped scan read nothing, so require-code-mention has no evidence
+  // either way. Reporting its sections as uncovered would turn a bailout into
+  // a wall of errors pointing at the wrong problem.
+  it('reports the skip rather than failing every require-code-mention section', async () => {
+    const result = await checkCodeRefs(latDir('error-require-code-mention'), {
+      maxFiles: 0,
+    });
+    expect(result.skipped?.reason).toBe('too-many-files');
+    expect(result.errors).toHaveLength(0);
+  });
+
+  // The failure this guards against is silent success: a check that never ran
+  // must not print as one, or a `lat check` green light means nothing.
+  it('never renders a skipped scan as a pass', async () => {
+    // valid-index otherwise checks clean, so the only thing separating these
+    // two runs is whether the scan ran.
+    const clean = stripAnsi(
+      (await checkAllCommand(testCtx('valid-index'))).output,
+    );
+    expect(clean).toContain('All checks passed');
+    expect(clean).not.toContain('not scanned');
+
+    const out = stripAnsi(
+      (await checkAllCommand(testCtx('valid-index'), { maxFiles: 0 })).output,
+    );
+    expect(out).toContain('code refs not scanned (too-many-files');
+    expect(out).not.toContain('All checks passed');
   });
 });
 

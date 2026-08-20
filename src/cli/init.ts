@@ -5,7 +5,8 @@ import {
   writeFileSync,
   readFileSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { styleText } from 'node:util';
@@ -1217,6 +1218,46 @@ export async function initCmd(targetDir?: string): Promise<void> {
 
   const root = resolve(targetDir ?? process.cwd());
   const latDir = join(root, 'lat.md');
+
+  // A lat root defines the code-ref scan's boundary: every `lat check` walks
+  // everything beneath it. Adopted above a repository — at a home directory,
+  // or a node's state root holding backups, logs, and mounted trees — that
+  // boundary is the whole account, and routine commands walk it.
+  const toHome = relative(root, resolve(homedir()));
+  const rootHoldsHome =
+    toHome === '' || (!toHome.startsWith('..') && !isAbsolute(toHome));
+  if (rootHoldsHome) {
+    console.log('');
+    console.log(
+      styleText('red', 'Refusing to init here:') +
+        ` ${root} is at or above your home directory.`,
+    );
+    console.log(
+      styleText(
+        'dim',
+        '  lat.md/ belongs at a repository root. cd there and re-run.',
+      ),
+    );
+    return;
+  }
+  if (!existsSync(join(root, '.git'))) {
+    console.log('');
+    console.log(
+      styleText('yellow', 'Warning:') +
+        ` ${root} is not a git repository root.`,
+    );
+    console.log(
+      styleText(
+        'dim',
+        '  This directory becomes the scan boundary for `lat check`.',
+      ) +
+        styleText(
+          'dim',
+          ' If it holds data, logs, or other projects, init one level down instead.',
+        ),
+    );
+    console.log('');
+  }
 
   const interactive = process.stdin.isTTY ?? false;
 

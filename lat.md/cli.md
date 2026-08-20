@@ -65,7 +65,7 @@ Validation command group. Runs all checks when invoked without a subcommand.
 
 Usage: `lat check [md|code-refs|index|sections]`
 
-Emits a stale-init warning before any errors so the user sees setup issues first. The init version check compares `INIT_VERSION` in [[src/init-version.ts]] against the version in `lat.md/.cache/lat_init.json` written by [[cli#init]]. Missing LLM key warning appears only when all checks pass. If the total check took longer than one second and ripgrep is not installed, shows a tip suggesting the user install it for faster scanning. The first output line ("Scanned ...") includes the total elapsed time (e.g. "in 250ms" or "in 1.2s").
+A code-ref scan that hit one of its [[dev-process#File Walking#Scan Bounds]] is reported, never rolled into a pass: the summary line reads "Checks passed, except code refs (not scanned)" and names the reason. Emits a stale-init warning before any errors so the user sees setup issues first. The init version check compares `INIT_VERSION` in [[src/init-version.ts]] against the version in `lat.md/.cache/lat_init.json` written by [[cli#init]]. Missing LLM key warning appears only when all checks pass. If the total check took longer than one second and ripgrep is not installed, shows a tip suggesting the user install it for faster scanning. The first output line ("Scanned ...") includes the total elapsed time (e.g. "in 250ms" or "in 1.2s").
 
 Implementation: [[src/cli/check.ts]]
 
@@ -79,6 +79,8 @@ Two validations:
 
 1. Every `// @lat: [[...]]`, `# @lat: [[...]]`, or `-- @lat: [[...]]` (SQL) comment in source code must point to a real section in `lat.md/`
 2. For files with [[markdown#Frontmatter#require-code-mention]], every leaf section must be referenced by at least one `// @lat:` comment in the codebase
+
+Both need a scan that ran. When [[src/code-refs.ts#scanCodeRefs]] reports `skipped`, neither validation executes — check (1) would pass on an empty ref set and check (2) would fail every leaf section on the same absent evidence.
 
 ### sections
 
@@ -144,6 +146,8 @@ Implementation: [[src/cli/gen.ts]]
 Interactive setup wizard. Walks the user through initializing lat.md in a project, with per-agent configuration for multiple coding tools.
 
 Usage: `lat init [dir]`
+
+Before any step runs, the target directory is vetted, because it becomes the scan boundary for every later `lat check` (see [[dev-process#File Walking#Scan Bounds]]). A directory at or above `$HOME` is **refused** — [[src/lattice.ts#findLatticeDir]] would never resolve a root there, so adopting one produces a graph nothing can find. A directory that is not a git repository root is allowed but warned about: it is the shape a node's state root takes, where the scan would walk backups, logs, and mounted trees.
 
 Steps:
 

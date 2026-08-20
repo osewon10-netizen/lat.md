@@ -4,30 +4,98 @@ import { join, relative } from 'node:path';
 import { toPosix, walkEntries } from './walk.js';
 
 /** Glob patterns used to exclude directories/files from code-ref scanning.
- *  Shared between rg args and the TS fallback's walkFiles filter. */
+ *  Shared between rg args and the shared isExcluded() path filter. */
 const EXCLUDE_DIRS = ['lat.md', '.claude'];
 const EXCLUDE_GLOBS = ['*.md'];
 
+/** Every EXCLUDE_GLOBS entry is a `*<suffix>` basename glob. */
+const EXCLUDE_SUFFIXES = EXCLUDE_GLOBS.map((g) => g.replace(/^\*/, ''));
+
+/**
+ * Wall-clock budget for a single scan subprocess. A scan is a bounded chore,
+ * never a reason for a command — or a hook sitting in front of a tool call —
+ * to hang: past the budget the child is killed and the scan reports itself
+ * skipped rather than grinding on unattended.
+ */
+export const DEFAULT_SCAN_TIMEOUT_MS = 20_000;
+
+/**
+ * Ceiling on files considered in one scan. A tree this large is not a project:
+ * the cause is a `lat.md/` adopted above a repository — a home directory, or a
+ * node's state root full of backups, logs, and mounted trees — so the honest
+ * answer is to refuse and say why, not to walk them.
+ */
+export const MAX_SCAN_FILES = 50_000;
+
+/**
+ * rg skips files larger than this in the content pass. `@lat:` markers live in
+ * line comments in source files; without the cap one stray log or model blob
+ * dominates the only pass that has to read bytes.
+ */
+const MAX_FILESIZE = '1M';
+
+/** Why a scan returned no refs without having actually looked. */
+export type ScanSkip = {
+  reason: 'too-many-files' | 'timed-out' | 'scan-failed';
+  message: string;
+};
+
+export type CodeRef = {
+  target: string;
+  file: string;
+  line: number;
+};
+
+export type ScanResult = {
+  refs: CodeRef[];
+  files: string[];
+  usedRg: boolean;
+  /**
+   * Set when the scan bailed out. `refs` is then empty because nothing was
+   * read — never because nothing was found. A caller that reports a clean
+   * result on a skipped scan is reporting a check it never ran.
+   */
+  skipped?: ScanSkip;
+};
+
+/**
+ * Directories carrying their own `lat.md/` are sub-projects: their refs belong
+ * to their own graph, not this one. Derived from a file list rather than from
+ * a dedicated scan, so one traversal answers this and the in-scope file list
+ * both.
+ */
+function findSubProjects(relPaths: string[]): string[] {
+  const subProjects = new Set<string>();
+  for (const p of relPaths) {
+    // "tests/cases/foo/lat.md/specs.md" → "tests/cases/foo". A leading
+    // "lat.md/" (this project's own graph) has no parent prefix and is not a
+    // sub-project; EXCLUDE_DIRS covers it.
+    const i = p.indexOf('/lat.md/');
+    if (i !== -1) subProjects.add(p.slice(0, i));
+  }
+  return [...subProjects];
+}
+
+/**
+ * The exclusion rules applied to a projectRoot-relative POSIX path. One
+ * predicate for both scan paths, mirroring the `--glob` args rg gets for the
+ * content pass — so the reported file list and the searched set are the same
+ * set however the scan ran.
+ */
+function isExcluded(rel: string, subProjects: string[]): boolean {
+  const dirs = rel.split('/').slice(0, -1);
+  if (dirs.some((d) => EXCLUDE_DIRS.includes(d))) return true;
+  if (EXCLUDE_SUFFIXES.some((s) => rel.endsWith(s))) return true;
+  return subProjects.some((sp) => rel.startsWith(sp + '/'));
+}
+
 /** Walk project files for code-ref scanning. Uses walkEntries for .gitignore
- *  support, then additionally skips .md files, lat.md/, .claude/, and sub-projects. */
+ *  support, then applies the shared isExcluded() filter. */
 export async function walkFiles(dir: string): Promise<string[]> {
   const entries = await walkEntries(dir);
-
-  // Collect directories that contain their own lat.md/ (sub-projects)
-  const subProjects = new Set<string>();
-  for (const e of entries) {
-    const i = e.indexOf('/lat.md/');
-    if (i !== -1) subProjects.add(e.slice(0, i + 1));
-  }
-
+  const subProjects = findSubProjects(entries);
   return entries
-    .filter(
-      (e) =>
-        !e.endsWith('.md') &&
-        !e.startsWith('lat.md/') &&
-        !e.startsWith('.claude/') &&
-        ![...subProjects].some((prefix) => e.startsWith(prefix)),
-    )
+    .filter((e) => !isExcluded(e, subProjects))
     .map((e) => join(dir, e));
 }
 
@@ -47,83 +115,67 @@ export const LAT_REF_RE = re('gv')`
   \]\]
 `;
 
-export type CodeRef = {
-  target: string;
-  file: string;
-  line: number;
-};
+type ExecOutcome =
+  | { ok: true; out: string }
+  | { ok: false; kind: 'missing' | 'timed-out' | 'failed'; detail: string };
 
-export type ScanResult = {
-  refs: CodeRef[];
-  files: string[];
-  usedRg: boolean;
+/** execFile's error carries a numeric exit code, which ErrnoException does not
+ *  model; `killed`/`signal` are how a timeout kill reports itself. */
+type ExecError = Error & {
+  code?: string | number;
+  killed?: boolean;
+  signal?: string | null;
 };
 
 /**
- * Run an external command and return stdout, or null if the command is not found
- * or fails.
+ * Run an external command under a wall-clock budget.
+ *
+ * The `kind` on failure is load-bearing: only 'missing' means "this tool isn't
+ * here, try another way". A timed-out or failed scan must NOT be retried by a
+ * slower path over the same tree — that turns a bounded subprocess into an
+ * unbounded one.
  */
 function tryExec(
   cmd: string,
   args: string[],
   cwd: string,
-): Promise<string | null> {
+  timeoutMs: number,
+): Promise<ExecOutcome> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd, maxBuffer: 50 * 1024 * 1024 }, (err, out) => {
-      if (err) {
-        // Exit code 1 with no stderr typically means "no matches" for grep/rg
-        const exitCode = (
-          err as NodeJS.ErrnoException & { code?: string | number }
-        ).code;
-        if (exitCode === 'ENOENT') {
-          resolve(null); // command not found
+    execFile(
+      cmd,
+      args,
+      { cwd, maxBuffer: 50 * 1024 * 1024, timeout: timeoutMs },
+      (err, out, stderr) => {
+        if (!err) {
+          resolve({ ok: true, out });
           return;
         }
-        // rg/grep exit 1 = no matches (not an error)
-        if (
-          'status' in err &&
-          (err as { status?: number }).status === 1 &&
-          out === ''
-        ) {
-          resolve('');
+        const e = err as ExecError;
+        if (e.code === 'ENOENT') {
+          resolve({ ok: false, kind: 'missing', detail: `${cmd} not on PATH` });
           return;
         }
-        resolve(null);
-        return;
-      }
-      resolve(out);
-    });
+        // rg/grep exit 1 = "no matches": a completed search with an empty
+        // result, not a failure. Misreading it as one used to drop every
+        // ref-free tree onto the TS fallback, which then re-read the whole
+        // tree in-process — the slow path, chosen precisely when rg had
+        // already done the job.
+        if (e.code === 1) {
+          resolve({ ok: true, out: out ?? '' });
+          return;
+        }
+        const killed = e.killed === true || e.signal != null;
+        resolve({
+          ok: false,
+          kind: killed ? 'timed-out' : 'failed',
+          detail: killed
+            ? `${cmd} exceeded its ${Math.round(timeoutMs / 1000)}s budget`
+            : (stderr || '').split('\n')[0] || e.message.split('\n')[0],
+        });
+      },
+    );
   });
-}
-
-/**
- * Detect sub-projects (directories containing their own lat.md/) using
- * rg --files. Finds files inside nested lat.md/ dirs and extracts the parent
- * directory paths. Returns paths relative to projectRoot.
- */
-async function findSubProjects(projectRoot: string): Promise<string[]> {
-  // List files inside any lat.md/ dir, then extract unique parent paths.
-  // The root lat.md/ is excluded by EXCLUDE_DIRS in the caller, so we only
-  // need to find nested ones here — search for files under */lat.md/.
-  const out = await tryExec(
-    'rg',
-    ['--files', '--glob', '**/lat.md/**', '.'],
-    projectRoot,
-  );
-  if (!out) return [];
-
-  const subProjects = new Set<string>();
-  for (const rawLine of out.split('\n')) {
-    if (!rawLine) continue;
-    // rg emits native separators on Windows; normalize before matching '/lat.md/'.
-    const line = toPosix(rawLine);
-    const clean = line.startsWith('./') ? line.slice(2) : line;
-    // "tests/cases/foo/lat.md/specs.md" → "tests/cases/foo"
-    // Skip root lat.md/ (no parent prefix — starts with "lat.md/")
-    const idx = clean.indexOf('/lat.md/');
-    if (idx !== -1) subProjects.add(clean.slice(0, idx));
-  }
-  return [...subProjects];
 }
 
 /** Build rg glob exclusion args. */
@@ -135,59 +187,89 @@ function rgExcludeArgs(subProjects: string[]): string[] {
   return args;
 }
 
+function skipped(reason: ScanSkip['reason'], message: string): ScanResult {
+  return { refs: [], files: [], usedRg: true, skipped: { reason, message } };
+}
+
 /**
- * Try scanning with ripgrep. Returns parsed refs and scanned file list, or null
- * if rg is not available. rg respects .gitignore by default; we add glob
- * exclusions for lat.md/, .claude/, *.md files, and sub-projects.
+ * Scan with ripgrep. Returns null — and only null — when rg is not installed,
+ * which is the one failure the TS fallback can answer.
+ *
+ * Two passes, not three: one `rg --files` supplies both the sub-project list
+ * and the in-scope file list, then one content pass reads bytes. `.gitignore`
+ * rules are honoured with `--no-require-git`, since rg otherwise ignores them
+ * outright whenever the scan root is not itself inside a git repository.
  */
 async function tryRipgrep(
   projectRoot: string,
-): Promise<{ refs: CodeRef[]; files: string[] } | null> {
-  // Detect sub-projects first so we can exclude them from all rg calls
-  const subProjects = await findSubProjects(projectRoot);
-  const excludes = rgExcludeArgs(subProjects);
-
-  // Search for @lat refs
-  const searchArgs = [
-    '--no-heading',
-    '--line-number',
-    '--with-filename',
-    ...excludes,
-    '@lat:.*\\[\\[',
-    '.',
-  ];
-  const out = await tryExec('rg', searchArgs, projectRoot);
-  if (out === null) return null;
-
-  const { refs } = parseGrepOutput(out, projectRoot);
-
-  // List all scanned files (for stats) — rg --files is fast
-  const filesOut = await tryExec(
+  timeoutMs: number,
+  maxFiles: number,
+): Promise<ScanResult | null> {
+  const listed = await tryExec(
     'rg',
-    ['--files', ...excludes, '.'],
+    ['--files', '--no-require-git', '.'],
     projectRoot,
+    timeoutMs,
   );
-  const files = (filesOut || '')
+  if (!listed.ok) {
+    if (listed.kind === 'missing') return null;
+    return skipped(
+      listed.kind === 'timed-out' ? 'timed-out' : 'scan-failed',
+      `listing files under ${projectRoot} failed: ${listed.detail}`,
+    );
+  }
+
+  const all = listed.out
     .split('\n')
     .filter(Boolean)
-    .map((f) => {
-      const clean = toPosix(f).replace(/^\.\//, '');
-      return join(projectRoot, clean);
-    });
+    .map((f) => toPosix(f).replace(/^\.\//, ''));
 
-  return { refs, files };
+  if (all.length > maxFiles) {
+    return skipped(
+      'too-many-files',
+      `${all.length} files under ${projectRoot} (limit ${maxFiles})`,
+    );
+  }
+
+  const subProjects = findSubProjects(all);
+  const files = all
+    .filter((f) => !isExcluded(f, subProjects))
+    .map((f) => join(projectRoot, f));
+
+  const searched = await tryExec(
+    'rg',
+    [
+      '--no-heading',
+      '--line-number',
+      '--with-filename',
+      '--no-require-git',
+      '--max-filesize',
+      MAX_FILESIZE,
+      ...rgExcludeArgs(subProjects),
+      '@lat:.*\\[\\[',
+      '.',
+    ],
+    projectRoot,
+    timeoutMs,
+  );
+  if (!searched.ok) {
+    if (searched.kind === 'missing') return null;
+    return skipped(
+      searched.kind === 'timed-out' ? 'timed-out' : 'scan-failed',
+      `searching ${projectRoot} failed: ${searched.detail}`,
+    );
+  }
+
+  return { refs: parseGrepOutput(searched.out), files, usedRg: true };
 }
 
 /**
  * Parse rg output lines (file:line:content) into CodeRef entries.
  */
-function parseGrepOutput(
-  output: string,
-  projectRoot: string,
-): { refs: CodeRef[] } {
+function parseGrepOutput(output: string): CodeRef[] {
   const refs: CodeRef[] = [];
 
-  if (!output.trim()) return { refs };
+  if (!output.trim()) return refs;
 
   for (const line of output.split('\n')) {
     if (!line) continue;
@@ -217,7 +299,7 @@ function parseGrepOutput(
     }
   }
 
-  return { refs };
+  return refs;
 }
 
 /**
@@ -256,24 +338,47 @@ async function scanWithTs(
   return refs;
 }
 
-/** Check whether ripgrep (`rg`) is available on PATH. */
-export async function hasRipgrep(): Promise<boolean> {
-  const result = await tryExec('rg', ['--version'], '.');
-  return result !== null;
-}
-
-export async function scanCodeRefs(projectRoot: string): Promise<ScanResult> {
-  // Fast path: use rg for both searching and file listing
-  // _LAT_DISABLE_RG is a test-only escape hatch to force the TS fallback
-  if (process.env._LAT_DISABLE_RG !== '1') {
-    const rgResult = await tryRipgrep(projectRoot);
-    if (rgResult !== null) {
-      return { refs: rgResult.refs, files: rgResult.files, usedRg: true };
-    }
-  }
-
-  // Fallback: walk files ourselves and scan with TS
+/**
+ * Fallback for hosts without ripgrep: walk the tree, then read every file.
+ * The file ceiling is enforced before the reads, which are the expensive half.
+ */
+async function scanWithWalk(
+  projectRoot: string,
+  maxFiles: number,
+): Promise<ScanResult> {
   const files = await walkFiles(projectRoot);
+  if (files.length > maxFiles) {
+    return {
+      ...skipped(
+        'too-many-files',
+        `${files.length} files under ${projectRoot} (limit ${maxFiles})`,
+      ),
+      usedRg: false,
+    };
+  }
   const refs = await scanWithTs(files, projectRoot);
   return { refs, files, usedRg: false };
+}
+
+/** Check whether ripgrep (`rg`) is available on PATH. */
+export async function hasRipgrep(): Promise<boolean> {
+  const result = await tryExec('rg', ['--version'], '.', 5_000);
+  return result.ok;
+}
+
+export async function scanCodeRefs(
+  projectRoot: string,
+  opts: { timeoutMs?: number; maxFiles?: number } = {},
+): Promise<ScanResult> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS;
+  const maxFiles = opts.maxFiles ?? MAX_SCAN_FILES;
+
+  // Fast path: rg for both file listing and searching.
+  // _LAT_DISABLE_RG is a test-only escape hatch to force the TS fallback
+  if (process.env._LAT_DISABLE_RG !== '1') {
+    const rgResult = await tryRipgrep(projectRoot, timeoutMs, maxFiles);
+    if (rgResult !== null) return rgResult;
+  }
+
+  return scanWithWalk(projectRoot, maxFiles);
 }
