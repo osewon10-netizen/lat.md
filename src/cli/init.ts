@@ -152,6 +152,35 @@ function latHookCommand(
 
 type HookEntry = { hooks?: { type?: string; command?: string }[] };
 
+/**
+ * Tools that BEGIN real work — a queue read, an item view, a claim. Matched
+ * across any ticketing surface (`mcp__<server>__<tool>`) rather than one
+ * vendor's server name, so the same settings work on every rig.
+ */
+const WORK_START_MATCHER = 'mcp__.*__(my_queue|claim_item|view_item)';
+
+/**
+ * Tools that END real work — the status transition, plan completion, and the
+ * archive. These are the wrap-up gate's trigger points.
+ */
+const WRAP_UP_MATCHER = 'mcp__.*__(update_status|complete_plan|archive_item)';
+
+/**
+ * Every surface `lat hook claude <event>` implements, with the matcher each
+ * needs. MUST stay in sync with hookCmd in src/cli/hook.ts — an event missing
+ * from this table is an implemented surface that silently never fires, which
+ * is exactly how this drifted to two entries while seven were shipping.
+ */
+const CLAUDE_HOOKS: { event: string; matcher?: string }[] = [
+  { event: 'SessionStart' },
+  { event: 'UserPromptSubmit' },
+  { event: 'Stop' },
+  { event: 'PreToolUse', matcher: `Bash|${WRAP_UP_MATCHER}` },
+  { event: 'PostToolUse', matcher: WORK_START_MATCHER },
+  { event: 'PostToolUseFailure', matcher: 'Bash' },
+  { event: 'WorktreeCreate' },
+];
+
 /** True if any command in this entry looks like it was installed by lat. */
 function isLatHookEntry(entry: HookEntry): boolean {
   const bin = resolve(process.argv[1]);
@@ -200,11 +229,12 @@ function syncLatHooks(settingsPath: string, style: LatCommandStyle): void {
   }
 
   // Add fresh hooks for current events
-  for (const event of ['UserPromptSubmit', 'Stop']) {
+  for (const { event, matcher } of CLAUDE_HOOKS) {
     if (!Array.isArray(hooks[event])) {
       hooks[event] = [];
     }
     (hooks[event] as unknown[]).push({
+      ...(matcher ? { matcher } : {}),
       hooks: [
         { type: 'command', command: latHookCommand(style, 'claude', event) },
       ],
@@ -361,55 +391,6 @@ function addMcpServer(
 
   mkdirSync(join(configPath, '..'), { recursive: true });
   writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n');
-}
-
-// ── Codex TOML MCP helpers ────────────────────────────────────────────
-
-/**
- * Check whether `.codex/config.toml` already contains an `[mcp_servers.lat]`
- * table.  We use a simple regex match — no TOML parser needed.
- */
-function hasCodexMcpServer(configPath: string): boolean {
-  if (!existsSync(configPath)) return false;
-  try {
-    const content = readFileSync(configPath, 'utf-8');
-    return /^\[mcp_servers\.lat\]/m.test(content);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Append an `[mcp_servers.lat]` table to `.codex/config.toml`.
- *
- * If the file exists, the block is appended (preserving existing content).
- * If the file doesn't exist, it is created with just the MCP block.
- *
- * The TOML format is intentionally simple — Codex expects:
- *
- * ```toml
- * [mcp_servers.lat]
- * command = "lat"
- * args = ["mcp"]
- * ```
- */
-function addCodexMcpServer(configPath: string, style: LatCommandStyle): void {
-  const cmd = styledMcpCommand(style);
-
-  // Format args as a TOML inline array of quoted strings
-  const argsToml = '[' + cmd.args.map((a) => `"${a}"`).join(', ') + ']';
-  const block = `[mcp_servers.lat]\ncommand = "${cmd.command}"\nargs = ${argsToml}\n`;
-
-  mkdirSync(join(configPath, '..'), { recursive: true });
-
-  if (existsSync(configPath)) {
-    let content = readFileSync(configPath, 'utf-8');
-    if (!content.endsWith('\n')) content += '\n';
-    content += '\n' + block;
-    writeFileSync(configPath, content);
-  } else {
-    writeFileSync(configPath, block);
-  }
 }
 
 // ── Template file helpers ─────────────────────────────────────────────
@@ -643,44 +624,18 @@ async function writeAgentsSkill(
 
 // ── Per-agent setup ──────────────────────────────────────────────────
 
-async function setupAgentsMd(
-  root: string,
-  latDir: string,
-  template: string,
-  hashes: Record<string, string>,
-  ask: (message: string) => Promise<boolean>,
-): Promise<void> {
-  const hash = await appendTemplateSection(
-    root,
-    latDir,
-    'AGENTS.md',
-    template,
-    'AGENTS.md',
-    '',
-    ask,
-  );
-  if (hash) hashes['AGENTS.md'] = hash;
-}
-
 async function setupClaudeCode(
   root: string,
   latDir: string,
-  template: string,
   hashes: Record<string, string>,
   ask: (message: string) => Promise<boolean>,
   style: LatCommandStyle,
 ): Promise<void> {
-  // CLAUDE.md — append-mode with markers (preserves user content)
-  const hash = await appendTemplateSection(
-    root,
-    latDir,
-    'CLAUDE.md',
-    template,
-    'CLAUDE.md',
-    '  ',
-    ask,
-  );
-  if (hash) hashes['CLAUDE.md'] = hash;
+  // No root CLAUDE.md (removed 2026-08-20). For Claude Code the block was
+  // redundant three times over: SessionStart emits the orientation, the
+  // Stop/commit/push gates enforce the checklist, and .claude/skills teaches
+  // authoring — all of them event-driven, unlike a file paid for on every
+  // request.
 
   // Hooks — UserPromptSubmit (lat.md reminders + [[ref]] expansion) and Stop (update reminder)
   console.log('');
@@ -728,33 +683,10 @@ async function setupClaudeCode(
   // Ensure .claude is gitignored (settings contain local absolute paths)
   ensureGitignored(root, '.claude');
 
-  // MCP server → .mcp.json at project root
-  console.log('');
-  console.log(
-    styleText(
-      'dim',
-      '  Agents can call `lat` from the command line, but an MCP server gives lat',
-    ),
-  );
-  console.log(
-    styleText(
-      'dim',
-      '  more visibility and makes agents more likely to use it proactively.',
-    ),
-  );
-
-  const mcpPath = join(root, '.mcp.json');
-  if (hasMcpServer(mcpPath, 'mcpServers')) {
-    console.log(styleText('green', '  MCP server') + ' already configured');
-  } else {
-    addMcpServer(mcpPath, 'mcpServers', style);
-    console.log(
-      styleText('green', '  MCP server') + ' registered in .mcp.json',
-    );
-  }
-
-  // Ensure .mcp.json is gitignored (it contains local absolute paths)
-  ensureGitignored(root, '.mcp.json');
+  // No MCP server (removed 2026-08-20). Claude Code has a shell, and every lat
+  // MCP tool is a thin wrapper over the same command function the CLI calls —
+  // so registering it bought nothing and cost six tool schemas in context on
+  // every request. Agents that cannot shell out (Cursor, Copilot) still get it.
 }
 
 async function setupCursor(
@@ -897,8 +829,8 @@ async function setupPi(
   ask: (message: string) => Promise<boolean>,
   style: LatCommandStyle,
 ): Promise<void> {
-  // AGENTS.md — Pi reads this natively
-  // (already created in the shared step if any non-Claude agent is selected)
+  // No root AGENTS.md — lat does not write repo-root instruction files.
+  // Pi picks lat up through its skill file and the MCP tools below.
 
   // .pi/extensions/lat.ts — extension that registers tools + lifecycle hooks
   console.log('');
@@ -965,8 +897,8 @@ async function setupOpenCode(
   ask: (message: string) => Promise<boolean>,
   style: LatCommandStyle,
 ): Promise<void> {
-  // AGENTS.md — OpenCode reads this natively
-  // (already created in the shared step if any non-Claude agent is selected)
+  // No root AGENTS.md — lat does not write repo-root instruction files.
+  // OpenCode picks lat up through its skill file and the MCP tools below.
 
   // .opencode/plugins/lat.ts — plugin that registers tools + lifecycle hooks
   console.log('');
@@ -1014,35 +946,11 @@ async function setupCodex(
   ask: (message: string) => Promise<boolean>,
   style: LatCommandStyle,
 ): Promise<void> {
-  // AGENTS.md — Codex reads this natively
-  // (already created in the shared step if any non-Claude agent is selected)
+  // No root AGENTS.md and no MCP server (both removed 2026-08-20). Codex has a
+  // shell, so the CLI already reaches every lat command the MCP wrapped; what
+  // it needs from lat is the skill file below.
 
-  // .codex/config.toml — MCP server registration
-  console.log('');
-  console.log(
-    styleText(
-      'dim',
-      '  Agents can call `lat` from the command line, but an MCP server gives lat',
-    ),
-  );
-  console.log(
-    styleText(
-      'dim',
-      '  more visibility and makes agents more likely to use it proactively.',
-    ),
-  );
-
-  const mcpPath = join(root, '.codex', 'config.toml');
-  if (hasCodexMcpServer(mcpPath)) {
-    console.log(styleText('green', '  MCP server') + ' already configured');
-  } else {
-    addCodexMcpServer(mcpPath, style);
-    console.log(
-      styleText('green', '  MCP server') + ' registered in .codex/config.toml',
-    );
-  }
-
-  // Ensure .codex is gitignored (config contains local absolute paths)
+  // Ensure .codex is gitignored (generated skill files, local paths)
   ensureGitignored(root, '.codex');
 
   // .agents/skills/lat-md/SKILL.md — skill for authoring lat.md files
@@ -1372,25 +1280,19 @@ export async function initCmd(targetDir?: string): Promise<void> {
     const template = readAgentsTemplate();
     const fileHashes: Record<string, string> = {};
 
-    // Step 3: AGENTS.md (shared by non-Claude agents)
-    const needsAgentsMd =
-      usePi || useCursor || useCopilot || useOpenCode || useCodex;
-    if (needsAgentsMd) {
-      await setupAgentsMd(root, latDir, template, fileHashes, ask);
-    }
+    // Step 3 (root AGENTS.md) was removed 2026-08-20: lat no longer writes
+    // instruction files at the repo root. AGENTS.md is the repo's own
+    // onboarding doc — owned by its authors, not by lat — and the guidance lat
+    // used to append there now reaches agents through channels that cost
+    // nothing when idle: the skill files, and the hooks that speak only on
+    // real debt. Per-agent rule files (.cursor/rules, copilot-instructions)
+    // still carry it for agents with no hook surface.
 
     // Step 4: Per-agent setup
     if (useClaudeCode) {
       console.log('');
       console.log(styleText('bold', 'Setting up Claude Code...'));
-      await setupClaudeCode(
-        root,
-        latDir,
-        template,
-        fileHashes,
-        ask,
-        commandStyle,
-      );
+      await setupClaudeCode(root, latDir, fileHashes, ask, commandStyle);
     }
 
     if (usePi) {

@@ -97,7 +97,9 @@ function makeTranscript(
     JSON.stringify({
       type: 'assistant',
       message: {
-        content: [{ type: 'tool_use', name: c.name, input: { file_path: c.file_path } }],
+        content: [
+          { type: 'tool_use', name: c.name, input: { file_path: c.file_path } },
+        ],
       },
     }),
   );
@@ -119,6 +121,7 @@ function runHook(
     sessionId?: string;
     toolName?: string;
     toolCommand?: string;
+    toolInput?: Record<string, unknown>;
     source?: string;
     toolResponseText?: string;
     worktreePath?: string;
@@ -130,10 +133,18 @@ function runHook(
     ...(opts.userPrompt ? { user_prompt: opts.userPrompt } : {}),
     ...(opts.sessionId ? { session_id: opts.sessionId } : {}),
     ...(opts.toolName ? { tool_name: opts.toolName } : {}),
-    ...(opts.toolCommand ? { tool_input: { command: opts.toolCommand } } : {}),
+    ...(opts.toolCommand
+      ? { tool_input: { command: opts.toolCommand } }
+      : opts.toolInput
+        ? { tool_input: opts.toolInput }
+        : {}),
     ...(opts.source ? { source: opts.source } : {}),
     ...(opts.toolResponseText
-      ? { tool_response: { content: [{ type: 'text', text: opts.toolResponseText }] } }
+      ? {
+          tool_response: {
+            content: [{ type: 'text', text: opts.toolResponseText }],
+          },
+        }
       : {}),
     ...(opts.worktreePath ? { worktree_path: opts.worktreePath } : {}),
   });
@@ -250,7 +261,9 @@ describe('hook session start', () => {
 describe('hook pre-tool-use (commit gate)', () => {
   // @lat: [[tests/hook#Commit gate denies once on staged code without lat.md]]
   it('denies a git commit once when staged code has no lat.md update, then yields', () => {
-    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/big-refactor.ts']]));
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[80, 30, 'src/big-refactor.ts']]),
+    );
     const sessionId = uniqueSessionId();
     try {
       const first = runHook('claude', 'PreToolUse', clean, {
@@ -261,7 +274,9 @@ describe('hook pre-tool-use (commit gate)', () => {
       });
       const parsed = JSON.parse(first.stdout);
       expect(parsed.hookSpecificOutput.permissionDecision).toBe('deny');
-      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain('lat.md');
+      expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain(
+        'lat.md',
+      );
 
       const second = runHook('claude', 'PreToolUse', clean, {
         fakeBinDir,
@@ -277,7 +292,9 @@ describe('hook pre-tool-use (commit gate)', () => {
 
   // @lat: [[tests/hook#Commit gate ignores non-commit commands]]
   it('stays silent for non-commit Bash commands', () => {
-    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/big-refactor.ts']]));
+    const fakeBinDir = makeFakeGitDir(
+      numstat([[80, 30, 'src/big-refactor.ts']]),
+    );
     try {
       const { stdout } = runHook('claude', 'PreToolUse', clean, {
         fakeBinDir,
@@ -294,7 +311,10 @@ describe('hook pre-tool-use (commit gate)', () => {
   // @lat: [[tests/hook#Commit gate passes proportional staged lat.md]]
   it('stays silent when staged lat.md changes are proportional', () => {
     const fakeBinDir = makeFakeGitDir(
-      numstat([[60, 40, 'src/feature.ts'], [8, 2, 'lat.md/feature.md']]),
+      numstat([
+        [60, 40, 'src/feature.ts'],
+        [8, 2, 'lat.md/feature.md'],
+      ]),
     );
     try {
       const { stdout } = runHook('claude', 'PreToolUse', clean, {
@@ -323,13 +343,23 @@ describe('hook pre-tool-use (session fire ceiling)', () => {
     };
     try {
       const first = runHook('claude', 'PreToolUse', clean, commitOpts);
-      expect(JSON.parse(first.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(
+        JSON.parse(first.stdout).hookSpecificOutput.permissionDecision,
+      ).toBe('deny');
 
-      writeFileSync(join(fakeBinDir, 'numstat.txt'), numstat([[90, 40, 'src/b.ts']]));
+      writeFileSync(
+        join(fakeBinDir, 'numstat.txt'),
+        numstat([[90, 40, 'src/b.ts']]),
+      );
       const second = runHook('claude', 'PreToolUse', clean, commitOpts);
-      expect(JSON.parse(second.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(
+        JSON.parse(second.stdout).hookSpecificOutput.permissionDecision,
+      ).toBe('deny');
 
-      writeFileSync(join(fakeBinDir, 'numstat.txt'), numstat([[100, 50, 'src/c.ts']]));
+      writeFileSync(
+        join(fakeBinDir, 'numstat.txt'),
+        numstat([[100, 50, 'src/c.ts']]),
+      );
       const third = runHook('claude', 'PreToolUse', clean, commitOpts);
       expect(third.stdout).toBe('');
     } finally {
@@ -355,12 +385,18 @@ describe('hook pre-tool-use (push checks)', () => {
       const first = runHook('claude', 'PreToolUse', clean, pushOpts);
       const firstParsed = JSON.parse(first.stdout);
       expect(firstParsed.hookSpecificOutput.permissionDecision).toBe('deny');
-      expect(firstParsed.hookSpecificOutput.permissionDecisionReason).toContain('lat.md');
+      expect(firstParsed.hookSpecificOutput.permissionDecisionReason).toContain(
+        'lat.md',
+      );
 
       const second = runHook('claude', 'PreToolUse', clean, pushOpts);
       const secondParsed = JSON.parse(second.stdout);
-      expect(secondParsed.hookSpecificOutput.permissionDecision).toBeUndefined();
-      expect(secondParsed.hookSpecificOutput.additionalContext).toContain('About to push');
+      expect(
+        secondParsed.hookSpecificOutput.permissionDecision,
+      ).toBeUndefined();
+      expect(secondParsed.hookSpecificOutput.additionalContext).toContain(
+        'About to push',
+      );
 
       runHook('claude', 'PreToolUse', clean, pushOpts); // second manifest fire
       const fourth = runHook('claude', 'PreToolUse', clean, pushOpts);
@@ -371,7 +407,7 @@ describe('hook pre-tool-use (push checks)', () => {
   });
 
   // @lat: [[tests/hook#Push fold check respects session attribution]]
-  it('does not deny a push over another session\'s dirty lat.md', () => {
+  it("does not deny a push over another session's dirty lat.md", () => {
     const fakeBinDir = makeFakeGitDir(numstat([[5, 1, 'lat.md/topic.md']]));
     try {
       const transcriptPath = makeTranscript(fakeBinDir, [
@@ -386,7 +422,9 @@ describe('hook pre-tool-use (push checks)', () => {
       });
       const parsed = JSON.parse(stdout);
       expect(parsed.hookSpecificOutput.permissionDecision).toBeUndefined();
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'About to push',
+      );
     } finally {
       rmDirBestEffort(fakeBinDir);
     }
@@ -420,8 +458,12 @@ describe('hook post-tool-use-failure (trap table)', () => {
       toolResponseText: 'error: Failed to spawn: pytest',
     });
     const parsed = JSON.parse(first.stdout);
-    expect(parsed.hookSpecificOutput.additionalContext).toContain('uv sync --extra dev');
-    expect(parsed.hookSpecificOutput.additionalContext).toContain('uv-extras-uninstalled');
+    expect(parsed.hookSpecificOutput.additionalContext).toContain(
+      'uv sync --extra dev',
+    );
+    expect(parsed.hookSpecificOutput.additionalContext).toContain(
+      'uv-extras-uninstalled',
+    );
 
     const second = runHook('claude', 'PostToolUseFailure', traps, {
       sessionId,
@@ -456,7 +498,9 @@ describe('hook pre-tool-use (docker stale-test guard)', () => {
     const first = runHook('claude', 'PreToolUse', clean, bare);
     const parsed = JSON.parse(first.stdout);
     expect(parsed.hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain('COPY layer');
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain(
+      'COPY layer',
+    );
 
     const retry = runHook('claude', 'PreToolUse', clean, bare);
     expect(retry.stdout).toBe('');
@@ -488,7 +532,9 @@ describe('hook pre-tool-use (two-lab push reminder)', () => {
       });
       const parsed = JSON.parse(stdout);
       expect(parsed.hookSpecificOutput.permissionDecision).toBeUndefined();
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'About to push',
+      );
       expect(parsed.hookSpecificOutput.additionalContext).toContain('two-lab');
     } finally {
       rmDirBestEffort(fakeBinDir);
@@ -511,8 +557,12 @@ describe('hook pre-tool-use (two-lab push reminder)', () => {
         toolCommand: 'git push',
       });
       const parsed = JSON.parse(stdout);
-      expect(parsed.hookSpecificOutput.additionalContext).toContain('About to push');
-      expect(parsed.hookSpecificOutput.additionalContext).not.toContain('two-lab fold:` commit');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'About to push',
+      );
+      expect(parsed.hookSpecificOutput.additionalContext).not.toContain(
+        'two-lab fold:` commit',
+      );
     } finally {
       rmDirBestEffort(fakeBinDir);
     }
@@ -531,8 +581,14 @@ describe('hook global advisory budget', () => {
     });
     try {
       // Spend the pool: orient(1) + work-start(1) + claim×2 + manifest×2 = 6.
-      runHook('claude', 'SessionStart', clean, { sessionId, source: 'startup' });
-      runHook('claude', 'PostToolUse', clean, { sessionId, toolName: 'mcp__electronics__my_queue' });
+      runHook('claude', 'SessionStart', clean, {
+        sessionId,
+        source: 'startup',
+      });
+      runHook('claude', 'PostToolUse', clean, {
+        sessionId,
+        toolName: 'mcp__electronics__my_queue',
+      });
       for (let i = 0; i < 2; i++) {
         runHook('claude', 'PostToolUse', clean, {
           sessionId,
@@ -562,7 +618,9 @@ describe('hook global advisory budget', () => {
         toolName: 'Bash',
         toolCommand: 'docker compose run --rm test',
       });
-      expect(JSON.parse(corrective.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+      expect(
+        JSON.parse(corrective.stdout).hookSpecificOutput.permissionDecision,
+      ).toBe('deny');
     } finally {
       rmDirBestEffort(fakeBinDir);
     }
@@ -725,7 +783,10 @@ describe('hook stop', () => {
   // @lat: [[tests/hook#Exits silently when lat.md/ changes are proportional]]
   it('exits silently when lat.md/ changes are proportional', () => {
     const fakeBinDir = makeFakeGitDir(
-      numstat([[60, 40, 'src/feature.ts'], [8, 2, 'lat.md/feature.md']]),
+      numstat([
+        [60, 40, 'src/feature.ts'],
+        [8, 2, 'lat.md/feature.md'],
+      ]),
     );
     try {
       const { stdout } = runStopHook('claude', clean, { fakeBinDir });
@@ -803,5 +864,181 @@ describe('hook stop', () => {
     } finally {
       rmDirBestEffort(fakeBinDir);
     }
+  });
+});
+
+const wrapup = join(casesDir, 'hook-wrapup');
+
+describe('hook pre-tool-use (stash is not a push)', () => {
+  // @lat: [[tests/hook#Stash is not treated as a remote push]]
+  it('does not run push checks on a git stash push', () => {
+    const fakeBinDir = makeFakeGitDir('', {
+      porcelain: ' M lat.md/feature.md\n',
+      oneline: 'abc1234 TK-1: fix\n',
+    });
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', clean, {
+        fakeBinDir,
+        sessionId: uniqueSessionId(),
+        toolName: 'Bash',
+        toolCommand: 'git stash push -- src/',
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
+  });
+});
+
+describe('hook pre-tool-use (wrap-up gate)', () => {
+  /**
+   * Transcript for a session that edited the fixture's source file, optionally
+   * also folding the `lat.md/` file that documents it.
+   */
+  function wrapupTranscript(dir: string, folded: boolean): string {
+    const calls = [
+      { name: 'Edit', file_path: join(wrapup, 'src', 'widget.ts') },
+    ];
+    if (folded) {
+      calls.push({
+        name: 'Edit',
+        file_path: join(wrapup, 'lat.md', 'widget.md'),
+      });
+    }
+    return makeTranscript(dir, calls);
+  }
+
+  // @lat: [[tests/hook#Wrap-up gate denies a ship transition with unfolded sections]]
+  it('denies a ship transition and names the unfolded section', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', wrapup, {
+        sessionId: uniqueSessionId(),
+        toolName: 'mcp__electronics__update_status',
+        toolInput: { id: 'PA-1', new_status: 'applied' },
+        transcriptPath: wrapupTranscript(dir, false),
+      });
+      const out = JSON.parse(stdout).hookSpecificOutput;
+      expect(out.permissionDecision).toBe('deny');
+      expect(out.permissionDecisionReason).toContain(
+        'lat.md/widget#Widget#Rendering',
+      );
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  // @lat: [[tests/hook#Wrap-up gate stays silent when the documenting section was touched]]
+  it('stays silent once the documenting section was folded', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', wrapup, {
+        sessionId: uniqueSessionId(),
+        toolName: 'mcp__electronics__update_status',
+        toolInput: { id: 'PA-1', new_status: 'applied' },
+        transcriptPath: wrapupTranscript(dir, true),
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  // @lat: [[tests/hook#Wrap-up gate ignores mid-work status values]]
+  it('ignores a non-terminal status transition', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', wrapup, {
+        sessionId: uniqueSessionId(),
+        toolName: 'mcp__electronics__update_status',
+        toolInput: { id: 'TK-1', new_status: 'in-progress' },
+        transcriptPath: wrapupTranscript(dir, false),
+      });
+      expect(stdout).toBe('');
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  // @lat: [[tests/hook#Wrap-up gate yields on a retried debt set]]
+  it('yields on an identical debt set retried', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const sessionId = uniqueSessionId();
+      const transcriptPath = wrapupTranscript(dir, false);
+      const opts = {
+        sessionId,
+        toolName: 'mcp__electronics__complete_plan',
+        toolInput: { id: 'IP-1' },
+        transcriptPath,
+      };
+      const first = runHook('claude', 'PreToolUse', wrapup, opts);
+      expect(
+        JSON.parse(first.stdout).hookSpecificOutput.permissionDecision,
+      ).toBe('deny');
+
+      const second = runHook('claude', 'PreToolUse', wrapup, opts);
+      expect(second.stdout).toBe('');
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  // @lat: [[tests/hook#Archive injects the residual reminder without blocking]]
+  it('archives with advisory context and no permission decision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', wrapup, {
+        sessionId: uniqueSessionId(),
+        toolName: 'mcp__electronics__archive_item',
+        toolInput: { id: 'TK-1', outcome: 'fixed' },
+        transcriptPath: wrapupTranscript(dir, true),
+      });
+      const out = JSON.parse(stdout).hookSpecificOutput;
+      expect(out.permissionDecision).toBeUndefined();
+      expect(out.additionalContext).toContain('known limitation');
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+
+  // @lat: [[tests/hook#Wrap-up matching ignores the MCP server name]]
+  it('fires on any surface exposing the tool', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lat-wrapup-'));
+    try {
+      const { stdout } = runHook('claude', 'PreToolUse', wrapup, {
+        sessionId: uniqueSessionId(),
+        // Underscored server name: the prefix strip must not eat the tool name.
+        toolName: 'mcp__minimart_toys__update_status',
+        toolInput: { id: 'TK-9', new_status: 'patched' },
+        transcriptPath: wrapupTranscript(dir, false),
+      });
+      expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe(
+        'deny',
+      );
+    } finally {
+      rmDirBestEffort(dir);
+    }
+  });
+});
+
+describe('hook user-prompt-submit (search opt-in)', () => {
+  // @lat: [[tests/hook#Prompt search stays off without the opt-in]]
+  it('resolves [[refs]] but runs no speculative search by default', () => {
+    // The ref path still fires — it answers something the user explicitly typed.
+    const withRef = runHook('claude', 'UserPromptSubmit', wrapup, {
+      sessionId: uniqueSessionId(),
+      userPrompt: 'check [[Rendering]] before editing',
+    });
+    expect(
+      JSON.parse(withRef.stdout).hookSpecificOutput.additionalContext,
+    ).toContain('Expanded user prompt');
+
+    // A plain prompt emits nothing: no search is attempted without the flag.
+    const plain = runHook('claude', 'UserPromptSubmit', wrapup, {
+      sessionId: uniqueSessionId(),
+      userPrompt: 'how does the widget renderer work',
+    });
+    expect(plain.stdout).toBe('');
   });
 });

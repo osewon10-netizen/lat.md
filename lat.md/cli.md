@@ -150,11 +150,10 @@ Steps:
 1. **lat.md/ directory** — if not present, asks whether to create it (via a one-off readline interface that is closed before step 2). Scaffolds from `templates/init/` (`.gitignore` and `README.md`). If it already exists, skips ahead.
 2. **Agent selection** — interactive checklist menu ([[src/cli/checklist-menu.ts#checklistMenu]]). All agents are shown at once with `[x]`/`[ ]` checkboxes; the cursor row is highlighted with `chalk.bgCyan`. Keys: up/down (j/k) to move, Space to toggle, Enter to confirm, Ctrl+C to abort. Returns an array of selected agent values. Non-TTY fallback returns `[]`. After confirmation, prints a summary line (e.g. "Selected: Claude Code, Cursor" or dim "None"). **Important:** the persistent readline interface is created _after_ this step — `checklistMenu` puts stdin into raw mode with its own `data` listener, which corrupts any co-existing readline interface.
 3. **Command style** — if any selected agent needs a lat command reference (all except Codex), a `selectMenu` asks "How should agents run lat?" with three options: `lat` (global install, portable), the resolved local binary path, or `npx lat.md@latest` (slow but zero-install). The choice determines what command string is written into hooks, MCP configs, and Pi extensions. Non-interactive mode defaults to `local`. Choosing `global` or `npx` makes generated config files portable and safe to commit.
-4. **AGENTS.md** — created if a non-Claude agent is selected (Cursor, Copilot, Codex). Shared instruction file. Uses marker-based append mode (see below).
-5. **Per-agent setup** — configures each selected agent (see subsections below). Each step prints a brief explanation of _why_ it's needed (e.g. why a hook is used instead of CLAUDE.md, why MCP is registered alongside CLI access).
-6. **LLM key setup** — checks for an existing key (env var or [[cli#Configuration File]]), and if missing, interactively prompts the user to paste one. Explains what semantic search is and why a key is needed before asking.
-7. **Version stamp + file hashes** — writes `INIT_VERSION` and SHA-256 hashes of all template-generated files to `lat.md/.cache/lat_init.json`. On re-run, compares current file content against stored hashes: unmodified files are silently updated to the latest template; user-modified files trigger a Y/n prompt offering to overwrite with the latest template, declining suggests [[cli#gen]].
-8. **Next steps** — after all setup completes, prints agent-specific guidance for having the agent document the codebase. For Claude Code, shows a runnable `claude "..."` command. For IDE agents (Cursor, Copilot, Pi, OpenCode, Codex), shows the prompt to paste into agent chat. Both suggest running `lat check` when done.
+4. **Per-agent setup** — configures each selected agent (see subsections below). Each step prints a brief explanation of _why_ it's needed (e.g. why a hook is used instead of CLAUDE.md, why MCP is registered alongside CLI access).
+5. **LLM key setup** — checks for an existing key (env var or [[cli#Configuration File]]), and if missing, interactively prompts the user to paste one. Explains what semantic search is and why a key is needed before asking.
+6. **Version stamp + file hashes** — writes `INIT_VERSION` and SHA-256 hashes of all template-generated files to `lat.md/.cache/lat_init.json`. On re-run, compares current file content against stored hashes: unmodified files are silently updated to the latest template; user-modified files trigger a Y/n prompt offering to overwrite with the latest template, declining suggests [[cli#gen]].
+7. **Next steps** — after all setup completes, prints agent-specific guidance for having the agent document the codebase. For Claude Code, shows a runnable `claude "..."` command. For IDE agents (Cursor, Copilot, Pi, OpenCode, Codex), shows the prompt to paste into agent chat. Both suggest running `lat check` when done.
 
 At the very end, after all steps complete, init checks whether ripgrep (`rg`) is available. If missing, prints a tip suggesting the user install it for faster code scanning, with a link to the ripgrep installation guide.
 
@@ -162,15 +161,20 @@ At the very start, before any steps, init prints the ASCII `lat.md` logo (cyan, 
 
 ### Claude Code
 
-Sets up `CLAUDE.md` and two agent hooks for the Claude Code coding agent.
+Sets up the full hook table and a skill for the Claude Code coding agent. Writes no repo-root instruction file.
 
-- `CLAUDE.md` — written using marker-based append mode (see below), preserving any user content outside the `%% lat:begin %%` / `%% lat:end %%` markers
-- Hooks synced in `.claude/settings.json` — on every run, all existing lat-owned hook entries are removed, then fresh entries are added for both events. Detection uses three heuristics: `/\blat\b/` in the command string, `hook claude ` substring (catches any install path), or command starting with the current binary path. Non-lat hooks are preserved. Both hooks call [[cli#hook]]:
-  - `UserPromptSubmit` → `lat hook claude UserPromptSubmit` — injects lat.md workflow reminders, auto-resolves `[[refs]]` in the prompt
-  - `Stop` → `lat hook claude Stop` — reminds the agent to update `lat.md/` before finishing
+- **No `CLAUDE.md`** (removed 2026-08-20) — see [[cli#init#Repo-root instruction files]]
+- Hooks synced in `.claude/settings.json` from [[src/cli/init.ts#CLAUDE_HOOKS]] — on every run, all existing lat-owned hook entries are removed, then fresh entries are added for every event in that table. Detection uses three heuristics: `/\blat\b/` in the command string, `hook claude ` substring (catches any install path), or command starting with the current binary path. Non-lat hooks are preserved. Both hooks call [[cli#hook]]:
+  That table is the single source of truth for which surfaces get installed, and
+  it MUST stay in sync with `hookCmd` in [[src/cli/hook.ts]] — an event missing
+  from it is an implemented surface that silently never fires, which is exactly
+  how init drifted to installing two hooks while seven were shipping (fixed
+  2026-08-20). Matchers are written server-agnostic
+  (`mcp__.*__(my_queue|claim_item|view_item)`) so the same settings work on any
+  rig rather than one vendor's server name.
 - `.claude/skills/lat-md/SKILL.md` — skill spec generated from `templates/skill/SKILL.md`. Teaches the agent how to author and maintain `lat.md/` files. Claude Code discovers it automatically from `.claude/skills/`.
 - `.claude` directory added to `.gitignore` (settings contain local absolute paths in hook commands)
-- [[cli#mcp]] server registered in `.mcp.json` at the project root (added to `.gitignore` since it contains absolute paths)
+- **No MCP server** (removed 2026-08-20) — see [[cli#mcp#Who gets it]]
 
 ### Pi
 
@@ -214,8 +218,8 @@ Sets up an OpenCode plugin that registers lat tools as native OpenCode tools and
 Sets up AGENTS.md, registers the MCP server, and installs skills for the Codex CLI agent.
 
 - `AGENTS.md` — shared instruction file (created in the shared step)
-- [[cli#mcp]] server registered in `.codex/config.toml` as a `[mcp_servers.lat]` TOML table
-- `.codex` directory added to `.gitignore` (config contains local absolute paths)
+- **No MCP server** (removed 2026-08-20) — see [[cli#mcp#Who gets it]]
+- `.codex` directory added to `.gitignore` (generated skill files, local paths)
 - `.agents/skills/lat-md/SKILL.md` — skill spec for authoring `lat.md/` files, placed in the cross-agent standard skills directory
 - `.codex/skills/lat-md/SKILL.md` — same skill spec in Codex's native skills directory
 
@@ -223,11 +227,27 @@ All setup steps are idempotent — existing configuration is detected and skippe
 
 `.gitignore` entries are only added if the target path is not already tracked in git (`git ls-files`); if tracked, the step prints a warning and skips to avoid a no-op ignore rule.
 
+### Repo-root instruction files
+
+lat does not write `AGENTS.md` or `CLAUDE.md` at the repo root (removed
+2026-08-20). `AGENTS.md` is the repo's own onboarding document, owned by its
+authors; appending to it put lat in conflict with the file's actual purpose.
+
+The guidance those blocks carried now reaches agents through channels that cost
+nothing when idle — the skill files, and hooks that speak only on real debt. For
+Claude Code the block had become redundant three times over: [[cli#hook#SessionStart]]
+emits the orientation, the Stop/commit/push/wrap-up gates enforce the checklist,
+and `.claude/skills/` teaches authoring. Agents with no hook surface still get
+prose through their own rule files (`.cursor/rules`, `copilot-instructions.md`).
+
+[[cli#init#Marker-based append mode]] therefore now applies only to
+`.github/copilot-instructions.md`.
+
 ### Marker-based append mode
 
 Shared files use `appendTemplateSection` to preserve user content outside lat's managed section.
 
-Template content is wrapped in visible `%% lat:begin %%` / `%% lat:end %%` markers. Applies to CLAUDE.md, AGENTS.md, and `.github/copilot-instructions.md`. On re-run: if markers exist and the section matches, it's skipped ("already up to date"); if the section matches the stored hash (unmodified by user), it's replaced in-place; if the user edited the section, init asks before replacing. If the file exists but has no markers (old full-overwrite init), and the full-file hash matches the stored hash, the existing content is migrated to marker format in-place. If the file has user content and no markers, the section is appended to the end. All other agent files (rules, skills, hooks, extensions, plugins) still use full-file `writeTemplateFile` since lat owns those entirely.
+Template content is wrapped in visible `%% lat:begin %%` / `%% lat:end %%` markers. Applies to `.github/copilot-instructions.md` (and, before 2026-08-20, the repo-root files described above). On re-run: if markers exist and the section matches, it's skipped ("already up to date"); if the section matches the stored hash (unmodified by user), it's replaced in-place; if the user edited the section, init asks before replacing. If the file exists but has no markers (old full-overwrite init), and the full-file hash matches the stored hash, the existing content is migrated to marker format in-place. If the file has user content and no markers, the section is appended to the end. All other agent files (rules, skills, hooks, extensions, plugins) still use full-file `writeTemplateFile` since lat owns those entirely.
 
 Implementation: [[src/cli/init.ts]], checklist menu in [[src/cli/checklist-menu.ts]], single-select menu in [[src/cli/select-menu.ts]], version tracking in [[src/init-version.ts]]
 
@@ -235,9 +255,12 @@ Implementation: [[src/cli/init.ts]], checklist menu in [[src/cli/checklist-menu.
 
 User-level configuration is stored in `~/.config/lat/config.json` (XDG Base Directory on Linux/macOS, `%APPDATA%\lat\config.json` on Windows). The `XDG_CONFIG_HOME` env var is respected if set.
 
-Currently supports one field:
+Fields:
 
 - `llm_key` — embedding API key for semantic search, used when `LAT_LLM_KEY` env var is not set
+- `repos` — per-repo settings keyed by absolute `lat.md/` path, durable across `.cache` wipes:
+  - `embedding` — pinned backend choice ([[cli#search#Backend selection]])
+  - `prompt_search` — opt back in to per-prompt semantic search ([[cli#hook#UserPromptSubmit]]); off by default
 
 Key resolution order: `LAT_LLM_KEY` > `LAT_LLM_KEY_FILE` > `LAT_LLM_KEY_HELPER` > config file `llm_key`. This applies everywhere: `lat search`, `lat check`, and the MCP `lat_search` tool.
 
@@ -259,7 +282,11 @@ Currently supports:
 Reads the hook input from stdin (JSON with `user_prompt` and `session_id`). Emits per-prompt DYNAMIC content only — static orientation lives in [[cli#hook#SessionStart]] (moved 2026-08-15); with nothing to emit it produces no output at all.
 
 1. If the prompt contains `[[refs]]`, resolves them inline using [[src/cli/expand.ts#expandPrompt]]
-2. Runs [[src/cli/search.ts#runSearch]] on the user prompt in **read-only mode** (`buildIndex: false`) — it searches an existing index but never builds or updates one, so a user's first prompt in a fresh repo isn't blocked by a full local embed pass (building the index is `lat search` / [[cli#reindex]], and until then this returns no matches). Then [[src/cli/section.ts#getSection]] + [[src/cli/section.ts#formatSectionOutput]] on each result, under the shared 8KB budget with an omission note. Gracefully degrades when nothing is indexed yet or the backend can't serve the index.
+2. Optionally runs the same budgeted search as [[cli#hook#PostToolUse — work-start orientation and claim-time auto-search]], but **off by default** (2026-08-20) behind the per-repo `prompt_search` flag in [[cli#Configuration File]].
+
+Speculative per-prompt search was the single most expensive thing lat did: ~2k tokens injected on EVERY prompt, re-paying for the same hot sections all session, guessed from prompt text that is often "let's look at X". The claim-time search replaced it with one firing on a far better query — the claimed item's own body — at the moment work actually starts. Repos with no ticketing surface never reach a claim, so they can trade the tokens back with the flag.
+
+What remains is demand-driven and free when idle: the user typed the `[[ref]]`, so resolving it answers an explicit request, and [[src/cli/hook.ts#hasWikiLinks]] short-circuits when there is none. It is deliberately NOT session-capped — a ref typed on the fortieth prompt must still resolve.
 
 ### Stop
 
@@ -323,6 +350,40 @@ state, never a hard wall (2026-08-15, operator-directed — replaces the
 turn-end Stop nag as the primary sync enforcement point on repos that wire
 it).
 
+### PreToolUse — the wrap-up gate
+
+Attach via a settings matcher to the ticketing tools that CLOSE work. Where the
+commit and push gates reason about line counts, this one names the specific
+sections that document the code the session changed and were never opened.
+
+[[src/cli/hook.ts#wrapUpKind]] classifies on the BARE tool name (`mcp__<server>__`
+stripped by [[src/cli/hook.ts#bareToolName]]) so one gate serves any ticketing
+surface, and splits the moment two ways:
+
+- **ship** — `update_status` to `patched`/`applied`, or `complete_plan`. The
+  implementer is declaring the work landed, so the fold should already be in the
+  pushed commits. Debt here is a real miss: deny once, yield on an identical debt
+  set (same marker discipline as the commit gate).
+- **archive** — `archive_item`. The verifying node closes the record; that
+  session wrote no code, so what it owes the graph is the residual, not a diff.
+  Advisory only — denying a close would strand the item.
+
+Deliberately excluded: mid-work `update_ticket`/`update_patch` notes (they fire
+many times per item), `close_plan` (nothing was implemented), and `verified`
+transitions (the node's call, not the implementer's).
+
+[[src/cli/hook.ts#documentingSections]] finds the sections both directions in ONE
+sweep of the graph — wiki links pointing INTO a touched file
+(`[[src/foo.ts#bar]]`) and `// @lat:` refs written INSIDE it naming their spec.
+Calling `findRefs` per file instead would reload every section and rescan the
+tree on each query, which a gate sitting in front of a tool call cannot afford.
+
+A section counts as addressed when this session wrote the file holding it, using
+the same transcript attribution as the Stop and push gates. That is file-granular
+on purpose: the fold has usually already been committed by this point, so there
+is no session-scoped diff left to intersect section line ranges against. It errs
+toward silence, consistent with every other gate here speaking only on real debt.
+
 ### PostToolUseFailure — the trap table
 
 Matches a failed command's output against `lat.md/traps.md` (sections of
@@ -374,6 +435,17 @@ Clients invoke this as `lat mcp`. The `lat init` wizard registers the MCP server
 - **lat_refs** — find references to a section (wraps [[cli#refs]])
 
 Each MCP tool calls the same command function as the CLI (e.g. `locateCommand`, `refsCommand`, `searchCommand`), passing a `CmdContext` with `plainStyler` and `mode: 'mcp'`. The `toMcp()` helper converts `CmdResult` to MCP response format. Uses `@modelcontextprotocol/sdk` with stdio transport. Resolves `lat.md/` from cwd.
+
+### Who gets it
+
+[[cli#init]] registers the server for Cursor and VS Code Copilot only (2026-08-20).
+
+Because every tool here is a thin wrapper over the command function the CLI
+already calls, an agent with a shell gains nothing from the MCP and pays six
+tool schemas of context on every request. Claude Code and Codex both have one,
+so they use `lat` directly. Cursor and Copilot keep the registration: their
+hooks do not reliably inject prompt-time context (see [[cli#init#Cursor]]) and
+shell access is not guaranteed, so MCP plus rules is their only path in.
 
 Implementation: [[src/mcp/server.ts]]
 

@@ -22,7 +22,7 @@ export type LatConfig = {
    * (survives deletion of the regenerable `.cache`), so a repo explicitly
    * switched to local stays local even after a cache wipe or fresh clone.
    */
-  repos?: Record<string, { embedding?: 'local' }>;
+  repos?: Record<string, { embedding?: 'local'; prompt_search?: boolean }>;
 };
 
 export function readConfig(): LatConfig {
@@ -59,10 +59,30 @@ export function setRepoEmbedding(
   const key = resolve(latDir);
   const config = readConfig();
   const repos = config.repos ?? {};
-  if (embedding === null) delete repos[key];
-  else repos[key] = { embedding };
+  if (embedding === null) {
+    // Preserve sibling per-repo settings; drop the entry only when empty.
+    const rest = { ...repos[key] };
+    delete rest.embedding;
+    if (Object.keys(rest).length > 0) repos[key] = rest;
+    else delete repos[key];
+  } else {
+    repos[key] = { ...repos[key], embedding };
+  }
   config.repos = repos;
   writeConfig(config);
+}
+
+// ── Per-repo prompt-search opt-in ───────────────────────────
+
+/**
+ * Whether the UserPromptSubmit hook should speculatively search on every
+ * prompt. OFF by default: the injection costs ~2k tokens per prompt and
+ * re-pays for the same hot sections all session, while the claim-time search
+ * fires once with a far better query (the item's own text). Repos with no
+ * ticketing surface — where no claim ever happens — can opt back in.
+ */
+export function getRepoPromptSearch(latDir: string): boolean {
+  return readConfig().repos?.[resolve(latDir)]?.prompt_search === true;
 }
 
 // ── Centralized LLM key resolution ─────────────────────────────────

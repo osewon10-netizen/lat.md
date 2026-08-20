@@ -9,7 +9,16 @@ import {
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join } from 'node:path';
-import { findLatticeDir } from '../lattice.js';
+import {
+  findLatticeDir,
+  listLatticeFiles,
+  loadAllSections,
+  flattenSections,
+  extractRefs,
+  type Section,
+} from '../lattice.js';
+import { scanCodeRefs } from '../code-refs.js';
+import { getRepoPromptSearch } from '../config.js';
 import { plainStyler, type CmdContext } from '../context.js';
 import { expandPrompt } from './expand.js';
 import { runSearch } from './search.js';
@@ -150,7 +159,11 @@ function bumpCounter(path: string, count: number): void {
   }
 }
 
-function counterPath(sessionId: string, latDir: string, surface: string): string {
+function counterPath(
+  sessionId: string,
+  latDir: string,
+  surface: string,
+): string {
   const key = createHash('sha1')
     .update(sessionId + '\0' + latDir + '\0' + surface)
     .digest('hex')
@@ -194,8 +207,12 @@ async function handleUserPromptSubmit(): Promise<void> {
     // If we can't parse stdin, still emit the reminder
   }
 
-  // Static orientation lives in SessionStart now — this hook emits only
-  // per-prompt dynamic content: resolved [[refs]] and budgeted search matches.
+  // Static orientation lives in SessionStart now, and the speculative
+  // per-prompt search moved to claim time (2026-08-20) — the claimed item's
+  // own text is a better query than a prompt, and the injection re-paid ~2k
+  // tokens EVERY prompt for the same hot sections. What is left is
+  // demand-driven: the user typed the [[ref]], so resolving it is answering
+  // an explicit request and costs nothing when absent.
   void sessionId;
   const parts: string[] = [];
   const latDir = findLatticeDir();
@@ -226,14 +243,17 @@ async function handleUserPromptSubmit(): Promise<void> {
       }
     }
 
-    // Search for relevant sections and include their full content
-    try {
-      const searchContext = await searchAndExpand(ctx, userPrompt);
-      if (searchContext) {
-        parts.push('', searchContext);
+    // Opt-in only: repos with no ticketing surface never hit the claim-time
+    // search, so they can trade the tokens back for automatic orientation.
+    if (getRepoPromptSearch(latDir)) {
+      try {
+        const searchContext = await searchAndExpand(ctx, userPrompt);
+        if (searchContext) {
+          parts.push('', searchContext);
+        }
+      } catch {
+        // Search failed (no key, index error) — agent can search manually
       }
-    } catch {
-      // Search failed (no key, index error, etc.) — agent can search manually
     }
   }
 
@@ -276,7 +296,9 @@ async function handleClaudeSessionStart(): Promise<void> {
   if (!latDir) return;
 
   if (source === 'compact') {
-    if (!tryFire(sessionId, latDir, 'compact-anchor', MAX_FIRES_PER_SESSION, true))
+    if (
+      !tryFire(sessionId, latDir, 'compact-anchor', MAX_FIRES_PER_SESSION, true)
+    )
       return;
     outputClaudeContext('SessionStart', COMPACT_REANCHOR);
   } else {
@@ -438,7 +460,10 @@ async function getStopStatus(
   const checkFailed = totalErrors > 0;
 
   const projectRoot = dirname(latDir);
-  const { codeLines, latMdLines } = tallyDiff(analyzeDiff(projectRoot), touched);
+  const { codeLines, latMdLines } = tallyDiff(
+    analyzeDiff(projectRoot),
+    touched,
+  );
   let needsSync = false;
   if (codeLines >= DIFF_THRESHOLD && latMdLines < LATMD_UPPER_THRESHOLD) {
     const effectiveLatMd = latMdLines === 0 ? 0 : Math.max(latMdLines, 1);
@@ -517,7 +542,10 @@ async function handleClaudeStop(): Promise<void> {
     // If we can't parse stdin, treat as first attempt
   }
 
-  const status = await getStopStatus(latDir, sessionTouchedFiles(transcriptPath));
+  const status = await getStopStatus(
+    latDir,
+    sessionTouchedFiles(transcriptPath),
+  );
 
   // Second pass — warn the user but don't block again
   if (stopHookActive) {
@@ -557,6 +585,7 @@ function isGitCommitCommand(command: string): boolean {
 async function handleClaudePreToolUse(): Promise<void> {
   let sessionId = '';
   let toolName = '';
+  let toolInput: Record<string, unknown> = {};
   let command = '';
   let transcriptPath: string | undefined;
   try {
@@ -564,17 +593,33 @@ async function handleClaudePreToolUse(): Promise<void> {
     const input = JSON.parse(raw);
     if (typeof input.session_id === 'string') sessionId = input.session_id;
     toolName = input.tool_name ?? '';
-    command = input.tool_input?.command ?? '';
+    toolInput = input.tool_input ?? {};
+    command = (toolInput.command as string) ?? '';
     if (typeof input.transcript_path === 'string')
       transcriptPath = input.transcript_path;
   } catch {
     return;
   }
-  if (toolName !== 'Bash') return;
 
   const latDir = findLatticeDir();
   const projectRoot = latDir ? dirname(latDir) : gitRoot();
   if (!projectRoot) return;
+
+  // Ticketing tools reach here too: closing an item is a wrap-up moment, and
+  // the settings matcher decides which surface's tools arrive.
+  if (toolName !== 'Bash') {
+    if (!latDir) return;
+    const kind = wrapUpKind(bareToolName(toolName), toolInput);
+    if (kind) {
+      await wrapUpGate(
+        latDir,
+        sessionId,
+        kind,
+        sessionTouchedFiles(transcriptPath),
+      );
+    }
+    return;
+  }
 
   // The docker guard is lat-independent — it protects any compose repo.
   if (isDockerBareTestCommand(command)) {
@@ -698,7 +743,11 @@ async function commitSyncGate(
 /** A Bash command that pushes to a remote, judged per segment like commits. */
 function isGitPushCommand(command: string): boolean {
   for (const segment of command.split(/&&|\|\||[;|\n]/)) {
-    if (/\bgit\b/.test(segment) && /\bpush\b/.test(segment)) return true;
+    if (!/\bgit\b/.test(segment)) continue;
+    // `git stash push` stores work locally and reaches no remote — counting
+    // it as a push made the gate fire on an ordinary stash.
+    if (/\bstash\b/.test(segment)) continue;
+    if (/\bpush\b/.test(segment)) return true;
   }
   return false;
 }
@@ -746,7 +795,10 @@ async function pushChecks(
       .digest('hex')
       .slice(0, 16);
     const marker = join(tmpdir(), 'lat-push-nudge-' + sig);
-    if (!existsSync(marker) && tryFire(sessionId, latDir, 'push-gate', MAX_FIRES_PER_SESSION)) {
+    if (
+      !existsSync(marker) &&
+      tryFire(sessionId, latDir, 'push-gate', MAX_FIRES_PER_SESSION)
+    ) {
       try {
         writeFileSync(marker, '');
       } catch {
@@ -772,7 +824,10 @@ async function pushChecks(
   const parts: string[] = [];
 
   const unpushed = run('git log @{upstream}..HEAD --oneline').trim();
-  if (unpushed && tryFire(sessionId, latDir, 'push-manifest', MAX_FIRES_PER_SESSION, true)) {
+  if (
+    unpushed &&
+    tryFire(sessionId, latDir, 'push-manifest', MAX_FIRES_PER_SESSION, true)
+  ) {
     parts.push(
       'About to push these commits (shared tree — verify every one is yours):\n' +
         unpushed,
@@ -798,6 +853,199 @@ async function pushChecks(
     // permission prompt for the push — context only, permission flow untouched.
     outputClaudeContext('PreToolUse', parts.join('\n\n'));
   }
+}
+
+/** Bare tool name with any `mcp__<server>__` prefix stripped. */
+function bareToolName(toolName: string): string {
+  return toolName.match(/^mcp__.+?__(.+)$/)?.[1] ?? toolName;
+}
+
+/**
+ * Which kind of wrap-up a tool call is, or null when it is ordinary mid-work
+ * traffic. Judged on the BARE name so one gate serves every ticketing surface.
+ *
+ * 'ship'    — the implementer declares the work landed. The fold should
+ *             already be in the pushed commits, so debt here is a real miss.
+ * 'archive' — the verifying node closes the record. That session wrote no
+ *             code; what it owes the graph is the residual, not a diff.
+ *
+ * Deliberately NOT included: mid-work `update_ticket`/`update_patch` notes
+ * (they fire many times per item), `close_plan` (nothing was implemented),
+ * and `verified` transitions (the node's call, not the implementer's).
+ */
+function wrapUpKind(
+  bare: string,
+  input: Record<string, unknown>,
+): 'ship' | 'archive' | null {
+  if (bare === 'archive_item') return 'archive';
+  if (bare === 'complete_plan') return 'ship';
+  if (bare === 'update_status') {
+    const status = String(input.new_status ?? '').toLowerCase();
+    return status === 'patched' || status === 'applied' ? 'ship' : null;
+  }
+  return null;
+}
+
+/** A lat.md section that documents a source file this session edited. */
+type DocSection = { section: Section; via: string };
+
+/** Repo-relative source files this session wrote, excluding the graph itself. */
+function sessionSourceFiles(
+  touched: Set<string>,
+  projectRoot: string,
+): string[] {
+  const prefix = normPath(projectRoot) + '/';
+  const out: string[] = [];
+  for (const t of touched) {
+    if (!t.startsWith(prefix)) continue;
+    const rel = t.slice(prefix.length);
+    if (rel.startsWith('lat.md/')) continue;
+    if (SOURCE_EXTENSIONS.has(extname(rel))) out.push(rel);
+  }
+  return out;
+}
+
+/**
+ * The lat.md sections documenting a set of source files, found both ways: wiki
+ * links pointing INTO a file (`[[src/foo.ts#bar]]`) and `// @lat:` refs written
+ * INSIDE it naming their spec. One sweep over the graph — findRefs() reloads
+ * every section and rescans the tree per query, which a gate sitting in front
+ * of a tool call cannot afford.
+ */
+async function documentingSections(
+  latDir: string,
+  projectRoot: string,
+  sourceFiles: string[],
+): Promise<DocSection[]> {
+  if (sourceFiles.length === 0) return [];
+  const targets = sourceFiles.map(normPath);
+  const isTarget = (t: string): boolean => {
+    const lower = normPath(t);
+    return targets.some((f) => lower === f || lower.startsWith(f + '#'));
+  };
+
+  const byId = new Map<string, Section>();
+  for (const s of flattenSections(await loadAllSections(latDir))) {
+    byId.set(s.id.toLowerCase(), s);
+  }
+
+  const found = new Map<string, DocSection>();
+  const add = (id: string, via: string): void => {
+    const section = byId.get(id.toLowerCase());
+    // Unresolvable ids are `lat check`'s business, not this gate's.
+    if (section) found.set(section.id.toLowerCase(), { section, via });
+  };
+
+  for (const file of await listLatticeFiles(latDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const ref of extractRefs(file, content, projectRoot)) {
+      if (isTarget(ref.target)) add(ref.fromSection, 'documents it');
+    }
+  }
+
+  try {
+    const { refs } = await scanCodeRefs(projectRoot);
+    for (const ref of refs) {
+      if (targets.includes(normPath(ref.file))) add(ref.target, 'its spec');
+    }
+  } catch {
+    // No ripgrep / unreadable tree — wiki links alone still carry the check.
+  }
+
+  return [...found.values()];
+}
+
+/**
+ * Wrap-up gate. Names the sections that document what this session changed and
+ * were never opened — section-level, where the Stop and commit gates only know
+ * line ratios (and a ratio is satisfied by touching ANY lat.md file).
+ *
+ * Authorship comes from the transcript, the same rule as everywhere else:
+ * without one there is nothing to attribute, so the debt check is skipped
+ * rather than guessed at.
+ */
+async function wrapUpGate(
+  latDir: string,
+  sessionId: string,
+  kind: 'ship' | 'archive',
+  touched: Set<string> | null,
+): Promise<void> {
+  const projectRoot = dirname(latDir);
+  const debt =
+    touched === null
+      ? []
+      : (
+          await documentingSections(
+            latDir,
+            projectRoot,
+            sessionSourceFiles(touched, projectRoot),
+          )
+        ).filter(({ section }) => !touchedHas(touched, section.filePath));
+
+  if (kind === 'ship' && debt.length === 0) return;
+
+  const listed = debt
+    .slice(0, 6)
+    .map(({ section, via }) => '  - ' + section.id + '  (' + via + ')')
+    .join('\n');
+  const more = debt.length > 6 ? '\n  …and ' + (debt.length - 6) + ' more' : '';
+
+  if (kind === 'ship') {
+    // Yield on an identical debt set, exactly like the commit gate: one nudge
+    // per state, never a wall in front of closing an item.
+    const sig = createHash('sha1')
+      .update(sessionId + '\0' + debt.map((d) => d.section.id).join('|'))
+      .digest('hex')
+      .slice(0, 16);
+    const marker = join(tmpdir(), 'lat-wrapup-nudge-' + sig);
+    if (existsSync(marker)) return;
+    if (!tryFire(sessionId, latDir, 'wrapup-gate', MAX_FIRES_PER_SESSION))
+      return;
+    try {
+      writeFileSync(marker, '');
+    } catch {
+      // Unwritable tmpdir: nudge again next time.
+    }
+
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'This marks the work done, but the lat.md/ section(s) documenting what you changed were never opened this session:\n' +
+            listed +
+            more +
+            '\nFold the durable part into them (or confirm they still read true) and commit before closing the item. ' +
+            'Re-run to proceed — this gate yields after one nudge per debt set.',
+        },
+      }),
+    );
+    return;
+  }
+
+  // Archive is the verifying node's close-out: advisory only. Denying it would
+  // strand the item, and that session owes the graph knowledge rather than a
+  // fold — so this speaks once and never blocks.
+  if (!tryFire(sessionId, latDir, 'wrapup-archive', 1, true)) return;
+  outputClaudeContext(
+    'PreToolUse',
+    [
+      'Archiving closes the record — anything learned here that outlives the item belongs in `lat.md/` first: a residual or known limitation verification could not settle, a new error signature as a `traps.md` entry, a durable invariant folded into its section.',
+      debt.length
+        ? 'Sections covering code touched in this session, still untouched:\n' +
+          listed +
+          more
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  );
 }
 
 type Trap = { name: string; re: RegExp; fix: string };
@@ -845,7 +1093,9 @@ async function handleClaudePostToolUseFailure(): Promise<void> {
     if (typeof input.session_id === 'string') sessionId = input.session_id;
     haystack = [
       extractToolResponseText(input.tool_response),
-      typeof input.error === 'string' ? input.error : JSON.stringify(input.error ?? ''),
+      typeof input.error === 'string'
+        ? input.error
+        : JSON.stringify(input.error ?? ''),
       input.tool_input?.command ?? '',
     ].join('\n');
   } catch {
@@ -942,7 +1192,9 @@ async function handleClaudePostToolUse(): Promise<void> {
   // text — a far better search query than any user prompt. Falls back to the
   // static reminder when no index is available.
   if (/claim_item/.test(toolName) && responseText) {
-    if (!tryFire(sessionId, latDir, 'claim-search', MAX_FIRES_PER_SESSION, true))
+    if (
+      !tryFire(sessionId, latDir, 'claim-search', MAX_FIRES_PER_SESSION, true)
+    )
       return;
     let searchContext: string | null = null;
     try {

@@ -177,3 +177,46 @@ Files that don't match `SOURCE_EXTENSIONS` (e.g. `.md`) are not counted toward c
 ## Cursor stop hook returns follow-up work instead of a Claude block
 
 When Cursor needs more work at stop time, the hook returns a `followup_message` payload instead of Claude's `decision: "block"` shape so the agent keeps going in Cursor's native hook format.
+
+## Wrap-up gate denies a ship transition with unfolded sections
+
+`update_status` to `patched` denies once when the session edited a source file
+whose documenting `lat.md/` section was never opened, naming that section in the
+reason so the agent knows exactly what to fold.
+
+## Wrap-up gate stays silent when the documenting section was touched
+
+The same transition passes without output once the session also wrote the
+`lat.md/` file holding the section that documents the changed source — the debt,
+not the transition, is what the gate reacts to.
+
+## Wrap-up gate ignores mid-work status values
+
+`update_status` to a non-terminal status is ordinary mid-work traffic and never
+reaches the debt check, so it produces no output regardless of fold state.
+
+## Wrap-up gate yields on a retried debt set
+
+Re-issuing the same transition against an unchanged debt set passes silently —
+one nudge per debt set, never a wall in front of closing an item.
+
+## Archive injects the residual reminder without blocking
+
+`archive_item` emits advisory context about recording residuals and known
+limitations, and carries no `permissionDecision` — denying a close would strand
+the item on the verifying node.
+
+## Wrap-up matching ignores the MCP server name
+
+A wrap-up tool is recognized by its bare name with any `mcp__<server>__` prefix
+stripped, so the same gate fires on whichever surface exposes the tool.
+
+## Prompt search stays off without the opt-in
+
+UserPromptSubmit runs no semantic search by default — a prompt with no `[[refs]]`
+emits nothing even when an index would have matched.
+
+## Stash is not treated as a remote push
+
+A `git stash push` segment reaches no remote, so the push checks do not fire on
+it — the word alone is not the signal.
