@@ -144,7 +144,7 @@ function styledMcpCommand(style: LatCommandStyle): {
 /** Derive the hook command prefix for the given command style. */
 function latHookCommand(
   style: LatCommandStyle,
-  agent: 'claude' | 'cursor',
+  agent: 'claude' | 'codex' | 'cursor',
   event: string,
 ): string {
   return `${latBinString(style)} hook ${agent} ${event}`;
@@ -164,6 +164,19 @@ const WORK_START_MATCHER = 'mcp__.*__(my_queue|claim_item|view_item)';
  * archive. These are the wrap-up gate's trigger points.
  */
 const WRAP_UP_MATCHER = 'mcp__.*__(update_status|complete_plan|archive_item)';
+
+/**
+ * The subset Codex can deliver. Its hook output contract is Claude's verbatim,
+ * so the same handlers serve both; it simply has no `PostToolUseFailure` (the
+ * trap table) or `WorktreeCreate` (settings propagation).
+ */
+const CODEX_HOOK_EVENTS = new Set([
+  'SessionStart',
+  'UserPromptSubmit',
+  'Stop',
+  'PreToolUse',
+  'PostToolUse',
+]);
 
 /**
  * Every surface `lat hook claude <event>` implements, with the matcher each
@@ -199,7 +212,11 @@ function isLatHookEntry(entry: HookEntry): boolean {
  * Remove all lat-owned hook entries from settings, then add fresh ones.
  * Preserves any non-lat hooks the user may have configured.
  */
-function syncLatHooks(settingsPath: string, style: LatCommandStyle): void {
+function syncLatHooks(
+  settingsPath: string,
+  style: LatCommandStyle,
+  agent: 'claude' | 'codex' = 'claude',
+): void {
   let settings: Record<string, unknown> = {};
   if (existsSync(settingsPath)) {
     const raw = readFileSync(settingsPath, 'utf-8');
@@ -229,14 +246,18 @@ function syncLatHooks(settingsPath: string, style: LatCommandStyle): void {
   }
 
   // Add fresh hooks for current events
-  for (const { event, matcher } of CLAUDE_HOOKS) {
+  const table =
+    agent === 'codex'
+      ? CLAUDE_HOOKS.filter((h) => CODEX_HOOK_EVENTS.has(h.event))
+      : CLAUDE_HOOKS;
+  for (const { event, matcher } of table) {
     if (!Array.isArray(hooks[event])) {
       hooks[event] = [];
     }
     (hooks[event] as unknown[]).push({
       ...(matcher ? { matcher } : {}),
       hooks: [
-        { type: 'command', command: latHookCommand(style, 'claude', event) },
+        { type: 'command', command: latHookCommand(style, agent, event) },
       ],
     });
   }
@@ -950,7 +971,37 @@ async function setupCodex(
   // shell, so the CLI already reaches every lat command the MCP wrapped; what
   // it needs from lat is the skill file below.
 
-  // Ensure .codex is gitignored (generated skill files, local paths)
+  // .codex/hooks.json — same shape and same output contract as Claude's
+  // settings.json, minus the two events Codex does not deliver.
+  console.log('');
+  console.log(
+    styleText(
+      'dim',
+      '  Hooks orient the agent at session start and gate commits, pushes, and',
+    ),
+  );
+  console.log(styleText('dim', '  item close-out on whether lat.md/ kept up.'));
+
+  const codexDir = join(root, '.codex');
+  mkdirSync(codexDir, { recursive: true });
+  syncLatHooks(join(codexDir, 'hooks.json'), style, 'codex');
+  console.log(styleText('green', '  Hooks') + ' synced in .codex/hooks.json');
+
+  // Codex refuses to load project-local hooks from an untrusted directory, and
+  // no file we write can grant that — it is a user decision recorded in the
+  // global config. Say so, or the hooks silently never fire.
+  console.log('');
+  console.log(
+    styleText(
+      'yellow',
+      '  Codex disables project-local hooks until the project is trusted.',
+    ),
+  );
+  console.log(styleText('dim', '  Add to ~/.codex/config.toml:'));
+  console.log(styleText('dim', `    [projects.'${root}']`));
+  console.log(styleText('dim', '    trust_level = "trusted"'));
+
+  // Ensure .codex is gitignored (hooks and skills contain local paths)
   ensureGitignored(root, '.codex');
 
   // .agents/skills/lat-md/SKILL.md — skill for authoring lat.md files

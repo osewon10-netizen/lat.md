@@ -869,6 +869,28 @@ describe('hook stop', () => {
 
 const wrapup = join(casesDir, 'hook-wrapup');
 
+describe('hook codex', () => {
+  // @lat: [[tests/hook#Codex shares the Claude hook contract]]
+  it('emits the Claude payload shape on a shared event', () => {
+    const { stdout } = runHook('codex', 'SessionStart', clean, {
+      sessionId: uniqueSessionId(),
+      source: 'startup',
+    });
+    const out = JSON.parse(stdout).hookSpecificOutput;
+    expect(out.hookEventName).toBe('SessionStart');
+    expect(out.additionalContext).toContain('lat search');
+  });
+
+  // @lat: [[tests/hook#Codex rejects the Claude-only surfaces]]
+  it('exits non-zero on a Claude-only event', () => {
+    const { exitCode, stderr } = runHook('codex', 'WorktreeCreate', clean, {
+      sessionId: uniqueSessionId(),
+    });
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain('Unknown hook event for codex');
+  });
+});
+
 describe('hook pre-tool-use (stash is not a push)', () => {
   // @lat: [[tests/hook#Stash is not treated as a remote push]]
   it('does not run push checks on a git stash push', () => {

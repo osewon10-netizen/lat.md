@@ -219,7 +219,8 @@ Sets up AGENTS.md, registers the MCP server, and installs skills for the Codex C
 
 - `AGENTS.md` — shared instruction file (created in the shared step)
 - **No MCP server** (removed 2026-08-20) — see [[cli#mcp#Who gets it]]
-- `.codex` directory added to `.gitignore` (generated skill files, local paths)
+- `.codex/hooks.json` — hook table synced from the Codex subset of [[src/cli/init.ts#CLAUDE_HOOKS]], followed by the trust instruction the hooks need to run at all ([[cli#hook#Codex]])
+- `.codex` directory added to `.gitignore` (hooks and skills contain local paths)
 - `.agents/skills/lat-md/SKILL.md` — skill spec for authoring `lat.md/` files, placed in the cross-agent standard skills directory
 - `.codex/skills/lat-md/SKILL.md` — same skill spec in Codex's native skills directory
 
@@ -274,7 +275,8 @@ Usage: `lat hook <agent> <event>`
 
 Currently supports:
 
-- `claude` with `UserPromptSubmit`, `Stop`, `PreToolUse`, and `PostToolUse`
+- `claude` with `UserPromptSubmit`, `Stop`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`, and `WorktreeCreate`
+- `codex` with the five of those it can deliver — see [[cli#hook#Codex]]
 - `cursor` with `stop`
 
 ### UserPromptSubmit
@@ -412,6 +414,31 @@ stranded fold, the docker stale-test guard) and trap fixes answering an
 error the agent just hit — bypasses the pool. Advisory parts that fire at
 the same moment merge into one message (e.g. the push manifest and the
 two-lab reminder).
+
+### Codex
+
+Codex implements Claude's hook output contract verbatim — `hookSpecificOutput`
+carrying `permissionDecision`, `permissionDecisionReason` and
+`additionalContext` — so [[src/cli/hook.ts#dispatchClaudeEvent]] serves both
+agents and every gate behaves identically there.
+
+[[src/cli/hook.ts#CODEX_EVENTS]] is the subset it can deliver: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`. It has no
+`PostToolUseFailure` (so no trap table) and no `WorktreeCreate` (so no settings
+propagation); asking for either exits non-zero rather than silently no-opping.
+
+Config lives in `.codex/hooks.json`, same shape as Claude's `settings.json`.
+**Codex refuses to load project-local hooks from an untrusted directory**, and
+no file lat writes can grant that — it is a user decision recorded in the
+global config:
+
+```toml
+[projects.'/abs/path/to/repo']
+trust_level = "trusted"
+```
+
+[[cli#init#Codex]] prints this after writing the file, because an untrusted
+project loads skills but silently drops hooks.
 
 ### cursor stop
 

@@ -1237,37 +1237,67 @@ async function handleCursorStop(): Promise<void> {
   outputCursorStop(reason);
 }
 
+/**
+ * Events Codex can deliver. It implements Claude's hook output contract
+ * verbatim — `hookSpecificOutput` with `permissionDecision`,
+ * `permissionDecisionReason` and `additionalContext` — so the handlers are
+ * shared rather than reimplemented. It has no `PostToolUseFailure` (the trap
+ * table) and no `WorktreeCreate` (settings propagation); those two surfaces
+ * are Claude-only.
+ */
+const CODEX_EVENTS = new Set([
+  'SessionStart',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PostToolUse',
+  'Stop',
+]);
+
+/** Run a Claude-contract hook event. Returns false for an unknown event. */
+async function dispatchClaudeEvent(event: string): Promise<boolean> {
+  switch (event) {
+    case 'UserPromptSubmit':
+      await handleUserPromptSubmit();
+      return true;
+    case 'Stop':
+      await handleClaudeStop();
+      return true;
+    case 'PreToolUse':
+      await handleClaudePreToolUse();
+      return true;
+    case 'PostToolUse':
+      await handleClaudePostToolUse();
+      return true;
+    case 'SessionStart':
+      await handleClaudeSessionStart();
+      return true;
+    case 'PostToolUseFailure':
+      await handleClaudePostToolUseFailure();
+      return true;
+    case 'WorktreeCreate':
+      await handleClaudeWorktreeCreate();
+      return true;
+    default:
+      return false;
+  }
+}
+
 export async function hookCmd(agent: string, event: string): Promise<void> {
   switch (agent) {
     case 'claude':
-      switch (event) {
-        case 'UserPromptSubmit':
-          await handleUserPromptSubmit();
-          return;
-        case 'Stop':
-          await handleClaudeStop();
-          return;
-        case 'PreToolUse':
-          await handleClaudePreToolUse();
-          return;
-        case 'PostToolUse':
-          await handleClaudePostToolUse();
-          return;
-        case 'SessionStart':
-          await handleClaudeSessionStart();
-          return;
-        case 'PostToolUseFailure':
-          await handleClaudePostToolUseFailure();
-          return;
-        case 'WorktreeCreate':
-          await handleClaudeWorktreeCreate();
-          return;
-        default:
-          console.error(
-            `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse, PostToolUseFailure, SessionStart, WorktreeCreate`,
-          );
-          process.exit(1);
-      }
+      if (await dispatchClaudeEvent(event)) return;
+      console.error(
+        `Unknown hook event for claude: ${event}. Supported: UserPromptSubmit, Stop, PreToolUse, PostToolUse, PostToolUseFailure, SessionStart, WorktreeCreate`,
+      );
+      process.exit(1);
+    // eslint-disable-next-line no-fallthrough
+    case 'codex':
+      if (CODEX_EVENTS.has(event) && (await dispatchClaudeEvent(event))) return;
+      console.error(
+        `Unknown hook event for codex: ${event}. Supported: ${[...CODEX_EVENTS].join(', ')}`,
+      );
+      process.exit(1);
+    // eslint-disable-next-line no-fallthrough
     case 'cursor':
       switch (event) {
         case 'stop':
@@ -1280,7 +1310,9 @@ export async function hookCmd(agent: string, event: string): Promise<void> {
           process.exit(1);
       }
     default:
-      console.error(`Unknown agent: ${agent}. Supported: claude, cursor`);
+      console.error(
+        `Unknown agent: ${agent}. Supported: claude, codex, cursor`,
+      );
       process.exit(1);
   }
 }

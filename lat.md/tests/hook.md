@@ -220,3 +220,13 @@ emits nothing even when an index would have matched.
 
 A `git stash push` segment reaches no remote, so the push checks do not fire on
 it — the word alone is not the signal.
+
+## Codex shares the Claude hook contract
+
+`lat hook codex SessionStart` emits the same `hookSpecificOutput` payload as the
+Claude surface, since Codex implements that contract verbatim.
+
+## Codex rejects the Claude-only surfaces
+
+`WorktreeCreate` and `PostToolUseFailure` are not events Codex delivers, so
+asking for them exits non-zero instead of silently doing nothing.
