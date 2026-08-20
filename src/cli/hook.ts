@@ -23,7 +23,6 @@ import { plainStyler, type CmdContext } from '../context.js';
 import { expandPrompt } from './expand.js';
 import { runSearch } from './search.js';
 import { getSection, formatSectionOutput } from './section.js';
-import { checkMd, checkCodeRefs, checkIndex, checkSections } from './check.js';
 import { SOURCE_EXTENSIONS } from '../source-parser.js';
 
 function outputClaudeContext(hookEventName: string, context: string): void {
@@ -437,28 +436,26 @@ function tallyDiff(
 }
 
 type StopStatus = {
-  checkFailed: boolean;
-  totalErrors: number;
   needsSync: boolean;
   codeLines: number;
   latMdLines: number;
 };
 
+/**
+ * Turn-end sync status. Deliberately does NOT run `lat check` (removed
+ * 2026-08-20): the graph's validity is already enforced mechanically twice —
+ * the test suite runs `lat check` against this repo's own graph, and CI runs it
+ * on every push and pull request — and the branch guide puts that suite in
+ * front of every push. A third gate at turn end bought nothing and cost the
+ * most: four full check passes (~700ms, scaling with the tree) on EVERY turn,
+ * blocking on errors it never attributed to the session that caused them, with
+ * no fire budget. On a shared tree that meant another session's broken link
+ * blocked yours, indefinitely, with a message implying it was your fault.
+ */
 async function getStopStatus(
   latDir: string,
   touched: Set<string> | null = null,
 ): Promise<StopStatus> {
-  const md = await checkMd(latDir);
-  const code = await checkCodeRefs(latDir);
-  const indexErrors = await checkIndex(latDir);
-  const sectionErrors = await checkSections(latDir);
-  const totalErrors =
-    md.errors.length +
-    code.errors.length +
-    indexErrors.length +
-    sectionErrors.length;
-  const checkFailed = totalErrors > 0;
-
   const projectRoot = dirname(latDir);
   const { codeLines, latMdLines } = tallyDiff(
     analyzeDiff(projectRoot),
@@ -470,25 +467,15 @@ async function getStopStatus(
     needsSync = effectiveLatMd < codeLines * LATMD_RATIO;
   }
 
-  return {
-    checkFailed,
-    totalErrors,
-    needsSync,
-    codeLines,
-    latMdLines,
-  };
+  return { needsSync, codeLines, latMdLines };
 }
 
 function formatStopReason({
-  checkFailed,
-  totalErrors,
   needsSync,
   codeLines,
   latMdLines,
 }: StopStatus): string | null {
-  if (!checkFailed && !needsSync) return null;
-
-  const parts: string[] = [];
+  if (!needsSync) return null;
 
   const syncMsg =
     latMdLines === 0
@@ -501,27 +488,10 @@ function formatStopReason({
         latMdLines +
         ' lines changed).';
 
-  if (checkFailed && needsSync) {
-    parts.push(
-      '`lat check` found errors. ' + syncMsg + ' Before finishing:',
-      '',
-      '1. Update `lat.md/` to reflect your code changes — run `lat search` to find relevant sections.',
-      '2. Run `lat check` until it passes.',
-    );
-  } else if (checkFailed) {
-    parts.push(
-      '`lat check` found ' +
-        totalErrors +
-        ' error(s). Run `lat check`, fix the errors, and repeat until it passes.',
-    );
-  } else {
-    parts.push(
-      syncMsg +
-        ' Verify `lat.md/` is in sync — run `lat search` to find relevant sections. Run `lat check` at the end.',
-    );
-  }
-
-  return parts.join('\n');
+  return (
+    syncMsg +
+    ' Verify `lat.md/` is in sync — run `lat search` to find relevant sections.'
+  );
 }
 
 async function handleClaudeStop(): Promise<void> {
@@ -542,20 +512,13 @@ async function handleClaudeStop(): Promise<void> {
     // If we can't parse stdin, treat as first attempt
   }
 
+  // Already blocked once this stop cycle: yield without so much as a git call.
+  if (stopHookActive) return;
+
   const status = await getStopStatus(
     latDir,
     sessionTouchedFiles(transcriptPath),
   );
-
-  // Second pass — warn the user but don't block again
-  if (stopHookActive) {
-    if (status.checkFailed) {
-      console.error(
-        `lat check is still failing (${status.totalErrors} error(s)). Run \`lat check\` to see details.`,
-      );
-    }
-    return;
-  }
 
   const reason = formatStopReason(status);
   if (!reason) return;

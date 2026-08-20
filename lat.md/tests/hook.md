@@ -37,13 +37,15 @@ work-start reminder; once budgets are spent, further claims are silent. (The
 search-injection path itself needs a live index and is verified live, not in
 fixtures.)
 
-## Exits silently when check passes and no diff
+## Exits silently on a clean tree
 
-When `lat check` passes and there is no git diff output, the hook produces no stdout and no stderr — the agent stops cleanly.
+With no git diff output the hook produces no stdout and no stderr — the agent stops cleanly.
 
-## Blocks when lat check fails
+## Does not block on a broken graph
 
-When `lat check` finds errors, the hook outputs a block decision with a reason mentioning `lat check` and the error count.
+Broken wiki links do not block a turn end.
+
+Graph validity is already enforced twice: the test suite runs `lat check` against the repo's own graph, and CI runs it on every push and pull request. A third gate at turn end blocked on errors it never attributed to the session that caused them.
 
 ## Blocks when code diff is large but lat.md/ not updated
 
@@ -158,17 +160,15 @@ When code changes are large but `lat.md/` changes exceed the 5% ratio, the hook 
 
 When code changes are below 5 lines, the ratio check is skipped and the hook exits silently.
 
-## Blocks with both messages when check fails and diff needs sync
+## Sync debt blocks without citing lat check
 
-When `lat check` fails and the diff also needs sync, the block reason includes both "update `lat.md/`" and "run `lat check` until it passes".
+With both a broken graph and sync debt, the block reason covers only the debt — the hook no longer runs `lat check` or mentions it.
 
-## Exits silently on second pass when check passes
+## Yields on the second pass
 
-On the second pass (`stop_hook_active: true`), if `lat check` passes, the hook exits silently with no output.
-
-## Prints stderr warning on second pass when check still fails
-
-On the second pass, if `lat check` still fails, the hook prints a warning to stderr but does not block — the loop stops.
+Having blocked once this stop cycle (`stop_hook_active: true`), the hook returns
+before doing any work at all — even a diff that would otherwise nag produces
+nothing.
 
 ## Ignores non-code files in diff
 

@@ -683,8 +683,8 @@ describe('hook post-tool-use (work-start reminder)', () => {
 });
 
 describe('hook stop', () => {
-  // @lat: [[tests/hook#Exits silently when check passes and no diff]]
-  it('exits silently when check passes and no diff', () => {
+  // @lat: [[tests/hook#Exits silently on a clean tree]]
+  it('exits silently on a clean tree', () => {
     const fakeBinDir = makeFakeGitDir('');
     try {
       const { stdout, stderr } = runStopHook('claude', clean, { fakeBinDir });
@@ -695,13 +695,18 @@ describe('hook stop', () => {
     }
   });
 
-  // @lat: [[tests/hook#Blocks when lat check fails]]
-  it('blocks when lat check fails', () => {
-    const { stdout } = runStopHook('claude', broken);
-    const parsed = JSON.parse(stdout);
-    expect(parsed.decision).toBe('block');
-    expect(parsed.reason).toContain('lat check');
-    expect(parsed.reason).toContain('error');
+  // @lat: [[tests/hook#Does not block on a broken graph]]
+  it('does not block on a broken graph', () => {
+    // The graph here has genuinely broken links. Turn end is not where that
+    // gets caught — the test suite and CI both run `lat check` already.
+    const fakeBinDir = makeFakeGitDir('');
+    try {
+      const { stdout, stderr } = runStopHook('claude', broken, { fakeBinDir });
+      expect(stdout).toBe('');
+      expect(stderr).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
   });
 
   // @lat: [[tests/hook#Blocks when code diff is large but lat.md/ not updated]]
@@ -807,36 +812,36 @@ describe('hook stop', () => {
     }
   });
 
-  // @lat: [[tests/hook#Blocks with both messages when check fails and diff needs sync]]
-  it('blocks with both messages when check fails and diff needs sync', () => {
+  // @lat: [[tests/hook#Sync debt blocks without citing lat check]]
+  it('blocks on sync debt alone, never citing lat check', () => {
     const fakeBinDir = makeFakeGitDir(numstat([[50, 60, 'src/refactor.ts']]));
     try {
+      // Broken graph AND sync debt: only the debt is this hook's business.
       const { stdout } = runStopHook('claude', broken, { fakeBinDir });
       const parsed = JSON.parse(stdout);
       expect(parsed.decision).toBe('block');
-      expect(parsed.reason).toContain('Update `lat.md/`');
-      expect(parsed.reason).toContain('lat check` until it passes');
+      expect(parsed.reason).toContain('lat.md/');
+      expect(parsed.reason).not.toContain('lat check');
     } finally {
       rmDirBestEffort(fakeBinDir);
     }
   });
 
-  // @lat: [[tests/hook#Exits silently on second pass when check passes]]
-  it('exits silently on second pass when check passes', () => {
-    const { stdout, stderr } = runStopHook('claude', clean, {
-      stopHookActive: true,
-    });
-    expect(stdout).toBe('');
-    expect(stderr).toBe('');
-  });
-
-  // @lat: [[tests/hook#Prints stderr warning on second pass when check still fails]]
-  it('prints stderr warning on second pass when check still fails', () => {
-    const { stdout, stderr } = runStopHook('claude', broken, {
-      stopHookActive: true,
-    });
-    expect(stdout).toBe('');
-    expect(stderr).toContain('still failing');
+  // @lat: [[tests/hook#Yields on the second pass]]
+  it('yields silently on the second pass', () => {
+    // Having blocked once this cycle it returns before any work at all, so
+    // even a diff that would otherwise nag produces nothing.
+    const fakeBinDir = makeFakeGitDir(numstat([[80, 30, 'src/big.ts']]));
+    try {
+      const { stdout, stderr } = runStopHook('claude', clean, {
+        fakeBinDir,
+        stopHookActive: true,
+      });
+      expect(stdout).toBe('');
+      expect(stderr).toBe('');
+    } finally {
+      rmDirBestEffort(fakeBinDir);
+    }
   });
 
   // @lat: [[tests/hook#Ignores non-code files in diff]]

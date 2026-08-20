@@ -292,13 +292,25 @@ What remains is demand-driven and free when idle: the user typed the `[[ref]]`, 
 
 ### Stop
 
-Conditionally blocks the agent from stopping — only when something is actually wrong.
+Conditionally blocks the agent from stopping — only when this session left `lat.md/` behind its own code changes.
+
+**It does not run `lat check`** (removed 2026-08-20). The graph's validity is
+already enforced mechanically twice: the test suite runs `lat check` against this
+repo's own graph (`tests/parser.test.ts`), and `.github/workflows/lat-check.yaml` runs it on
+every push and pull request — with the branch guide putting that suite in front
+of every push. A third gate at turn end was the worst-placed of the three: four
+full check passes on EVERY turn (~700ms, scaling with the tree, halved by the
+removal), blocking on errors it never attributed to the session that caused
+them, and alone among the hook surfaces in having no fire budget. On a shared
+tree that meant another session's broken link blocked yours indefinitely, with
+a message implying the fault was yours.
 
 1. **No `lat.md/` dir** — exit silently.
-2. **Run `lat check`** — always, on both first and second pass.
-3. **Second pass** (`stop_hook_active` true) — if check still fails, print warning to stderr (no block, loop stops). If check passes, exit silently.
-4. **First pass** — run `git diff HEAD --numstat`. When stdin carries a `transcript_path` (Claude Code supplies it), restrict the tally to files this session actually edited — write-tool calls (Edit/Write/MultiEdit/NotebookEdit) parsed from the transcript, matched by suffix against the repo-relative numstat paths, case-insensitive across slash styles. On a shared working tree another session's in-flight diff must not nag a bystander session: the sync debt follows authorship (2026-08-15; shell-mediated edits are invisible to this heuristic and don't count). Missing/unreadable transcript disables attribution and keeps the unfiltered tally. Then count `codeLines` (files matching [[src/source-parser.ts#SOURCE_EXTENSIONS]]) and `latMdLines`. Skip ratio check if `codeLines < 5` or `latMdLines >= 50` (enough doc work was clearly done). Otherwise round `latMdLines` up to 1 (if nonzero) and flag `needsSync` when `latMdLines < codeLines * 5%`.
-5. **Decision** — both pass: exit silently, clean output. Check failed + needs sync: block ("update `lat.md/`, then run `lat check` until it passes"). Check failed only: block ("run `lat check` until it passes"). Needs sync only: block with explicit context ("not updated" when 0 lat.md lines, "may not be fully in sync (N lines)" when some changes exist but below ratio).
+2. **Second pass** (`stop_hook_active` true) — return immediately, before any git call. Having blocked once this cycle, the hook has said its piece.
+3. **First pass** — run `git diff HEAD --numstat`. When stdin carries a `transcript_path` (Claude Code supplies it), restrict the tally to files this session actually edited — write-tool calls (Edit/Write/MultiEdit/NotebookEdit) parsed from the transcript, matched by suffix against the repo-relative numstat paths, case-insensitive across slash styles. On a shared working tree another session's in-flight diff must not nag a bystander session: the sync debt follows authorship (2026-08-15; shell-mediated edits are invisible to this heuristic and don't count). Missing/unreadable transcript disables attribution and keeps the unfiltered tally. Then count `codeLines` (files matching [[src/source-parser.ts#SOURCE_EXTENSIONS]]) and `latMdLines`. Skip ratio check if `codeLines < 5` or `latMdLines >= 50` (enough doc work was clearly done). Otherwise round `latMdLines` up to 1 (if nonzero) and flag `needsSync` when `latMdLines < codeLines * 5%`.
+4. **Decision** — no sync debt: exit silently. Otherwise block once with explicit context ("not updated" when 0 lat.md lines, "may not be fully in sync (N lines)" when some changes exist but below the ratio).
+
+This leaves Stop as the last diff-ratio surface. [[cli#hook#PreToolUse — the wrap-up gate]] makes the same argument at a better moment and with far better resolution — naming the sections that document the changed code rather than comparing line counts — so the ratio here is a coarse backstop, not the primary signal.
 
 ### SessionStart
 
