@@ -658,16 +658,19 @@ async function setupClaudeCode(
   // authoring — all of them event-driven, unlike a file paid for on every
   // request.
 
-  // Hooks — UserPromptSubmit (lat.md reminders + [[ref]] expansion) and Stop (update reminder)
+  // Hooks — the full CLAUDE_HOOKS table.
   console.log('');
   console.log(
     styleText(
       'dim',
-      '  Hooks inject lat.md workflow reminders into every prompt and remind',
+      '  Hooks orient the agent at session start, resolve [[refs]] in prompts,',
     ),
   );
   console.log(
-    styleText('dim', '  the agent to update lat.md/ before finishing.'),
+    styleText(
+      'dim',
+      '  and gate commits, pushes, and item close-out on lat.md/ staying in sync.',
+    ),
   );
 
   const claudeDir = join(root, '.claude');
@@ -676,7 +679,8 @@ async function setupClaudeCode(
   mkdirSync(claudeDir, { recursive: true });
   syncLatHooks(settingsPath, style);
   console.log(
-    styleText('green', '  Hooks') + ' synced (UserPromptSubmit + Stop)',
+    styleText('green', '  Hooks') +
+      ` synced in .claude/settings.json (${CLAUDE_HOOKS.length} events)`,
   );
 
   // .claude/skills/lat-md/SKILL.md — skill for authoring lat.md files
