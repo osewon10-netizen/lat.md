@@ -6,6 +6,11 @@ lat:
 
 Tests for the `lat expand` command that resolves `[[refs]]` and appends context blocks.
 
+The harness shells out to the built CLI, so the script path MUST be quoted — a
+repo checked out under a path containing spaces otherwise splits the command and
+hands node a truncated path, failing every case here for a reason that looks
+like a CLI bug rather than a harness one.
+
 ## Resolves exact ref with context
 
 When the input contains a `[[ref]]` that exactly matches a section, the output replaces it with the resolved id inline and appends a `<lat-context>` block with `is referring to:` phrasing and the section's location and body.

@@ -289,7 +289,9 @@ describe('expand', () => {
 
   function runExpand(text: string): string {
     return execSync(
-      `node ${join(import.meta.dirname, '..', 'dist', 'src', 'cli', 'index.js')} expand ${JSON.stringify(text)}`,
+      // Quoted: the repo path may contain spaces, which would otherwise split
+      // the command and hand node a truncated script path.
+      `node "${join(import.meta.dirname, '..', 'dist', 'src', 'cli', 'index.js')}" expand ${JSON.stringify(text)}`,
       {
         cwd: root,
         encoding: 'utf-8',
