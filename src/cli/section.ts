@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, relative } from 'node:path';
 import {
   loadAllSections,
+  loadRefSections,
   findSections,
   flattenSections,
   extractRefs,
@@ -11,10 +12,11 @@ import {
   type Section,
   type SectionMatch,
 } from '../lattice.js';
+import { lastCommitDate } from '../git.js';
 import { scanCodeRefs, type ScanSkip } from '../code-refs.js';
 import { SOURCE_EXTENSIONS, resolveSourceSymbol } from '../source-parser.js';
 import type { CmdContext, CmdResult } from '../context.js';
-import { formatSectionId, formatNavHints } from '../format.js';
+import { formatSectionId, formatNavHints, refTierNote } from '../format.js';
 
 export type CodeBackRef = {
   file: string;
@@ -41,6 +43,10 @@ export type SectionFound = {
   /** Set when the tree was never scanned, so an empty `codeRefs` means "not
    *  looked for" rather than "nothing points here". */
   codeScanSkipped?: ScanSkip;
+  /** The section came from a reference source, not the lattice. */
+  isRef?: boolean;
+  /** Last content change of that reference source, when known. */
+  sourceDate?: string | null;
 };
 
 export type SectionResult =
@@ -60,22 +66,29 @@ export async function getSection(
   const allSections = await loadAllSections(ctx.latDir);
   const matches = findSections(allSections, query);
 
-  if (matches.length === 0) {
-    return { kind: 'no-match', suggestions: [] };
+  const confident = (m: SectionMatch[]): boolean =>
+    m.length > 0 &&
+    (m[0].reason === 'exact match' ||
+      m[0].reason.startsWith('file stem expanded') ||
+      m[0].reason === 'section name match');
+
+  // Reference sources are searchable, so `lat section` has to be able to open
+  // one — but only after the lattice has had its say, so law always wins a
+  // name collision. Everything below this point is graph traversal that a
+  // reference section is exempt from by definition, hence the early return.
+  if (!confident(matches)) {
+    const refMatches = findSections(
+      await loadRefSections(ctx.projectRoot),
+      query,
+    );
+    if (confident(refMatches)) return refSection(ctx, refMatches[0].section);
+    if (matches.length === 0) {
+      return { kind: 'no-match', suggestions: refMatches };
+    }
+    return { kind: 'no-match', suggestions: [...matches, ...refMatches] };
   }
 
-  // Accept the top match if confident
-  const top = matches[0];
-  const isConfident =
-    top.reason === 'exact match' ||
-    top.reason.startsWith('file stem expanded') ||
-    top.reason === 'section name match';
-
-  if (!isConfident) {
-    return { kind: 'no-match', suggestions: matches };
-  }
-
-  const section = top.section;
+  const section = matches[0].section;
 
   // Read raw content between startLine and the end of the last descendant
   const absPath = join(ctx.projectRoot, section.filePath);
@@ -227,6 +240,33 @@ export async function getSection(
   };
 }
 
+/**
+ * Open a reference section: content only. No outgoing refs, no incoming refs,
+ * no code back-references — a reference source is not in the graph, so every
+ * one of those would be structurally empty and read as "nothing points here"
+ * rather than "this was never part of the graph".
+ */
+async function refSection(
+  ctx: CmdContext,
+  section: Section,
+): Promise<SectionFound> {
+  const absPath = join(ctx.projectRoot, section.filePath);
+  const lines = (await readFile(absPath, 'utf-8')).split('\n');
+  return {
+    kind: 'found',
+    section,
+    content: lines
+      .slice(section.startLine - 1, fullEndLine(section))
+      .join('\n'),
+    outgoingRefs: [],
+    outgoingSourceRefs: [],
+    incomingRefs: [],
+    codeRefs: [],
+    isRef: true,
+    sourceDate: lastCommitDate(ctx.projectRoot, section.filePath),
+  };
+}
+
 function fullEndLine(section: Section): number {
   if (section.children.length === 0) return section.endLine;
   return fullEndLine(section.children[section.children.length - 1]);
@@ -264,11 +304,20 @@ export function formatSectionOutput(
     .map((line) => (line ? `> ${line}` : '>'))
     .join('\n');
 
+  const tier = result.isRef ? s.yellow('[ref] ') : '';
+  const dated =
+    result.isRef && result.sourceDate
+      ? s.dim(` · last change ${result.sourceDate}`)
+      : '';
   const parts: string[] = [
-    `${s.bold('[[' + formatSectionId(section.id, s) + ']]')} (${loc})`,
+    `${tier}${s.bold('[[' + formatSectionId(section.id, s) + ']]')} (${loc})${dated}`,
     '',
     quoted,
   ];
+
+  if (result.isRef) {
+    parts.push('', refTierNote(s));
+  }
 
   if (outgoingRefs.length > 0 || outgoingSourceRefs.length > 0) {
     parts.push('', '## This section references:', '');

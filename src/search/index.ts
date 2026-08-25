@@ -2,7 +2,13 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Client } from '@libsql/client';
-import { loadAllSections, flattenSections, type Section } from '../lattice.js';
+import {
+  loadAllSections,
+  loadRefSections,
+  flattenSections,
+  type Section,
+} from '../lattice.js';
+import { lastCommitDate } from '../git.js';
 import type { Embedder } from './embedder.js';
 
 function hashContent(text: string): string {
@@ -33,17 +39,39 @@ export async function indexSections(
   onProgress?: (done: number, total: number) => void,
 ): Promise<IndexStats> {
   const projectRoot = dirname(latDir);
-  const allSections = await loadAllSections(latDir);
-  const flat = flattenSections(allSections);
+  const flat = [
+    ...flattenSections(await loadAllSections(latDir)),
+    ...flattenSections(await loadRefSections(projectRoot)),
+  ];
+
+  // One git call per reference *file*, not per section.
+  const dateCache = new Map<string, string | null>();
+  const sourceDateFor = (s: Section): string | null => {
+    if (!s.ref) return null;
+    if (!dateCache.has(s.filePath)) {
+      dateCache.set(s.filePath, lastCommitDate(projectRoot, s.filePath));
+    }
+    return dateCache.get(s.filePath)!;
+  };
 
   // Build current state: id -> { section, content, hash }
   const current = new Map<
     string,
-    { section: Section; content: string; hash: string }
+    {
+      section: Section;
+      content: string;
+      hash: string;
+      sourceDate: string | null;
+    }
   >();
   for (const s of flat) {
     const text = await sectionContent(s, projectRoot);
-    current.set(s.id, { section: s, content: text, hash: hashContent(text) });
+    current.set(s.id, {
+      section: s,
+      content: text,
+      hash: hashContent(text),
+      sourceDate: sourceDateFor(s),
+    });
   }
 
   // Get existing hashes from DB
@@ -80,9 +108,19 @@ export async function indexSections(
       const vecJson = JSON.stringify(vectors[i]);
 
       await db.execute({
-        sql: `INSERT OR REPLACE INTO sections (id, file, heading, content, content_hash, embedding, updated_at)
-              VALUES (?, ?, ?, ?, ?, vector(?), ?)`,
-        args: [id, section.file, section.heading, content, hash, vecJson, now],
+        sql: `INSERT OR REPLACE INTO sections (id, file, heading, content, content_hash, embedding, updated_at, kind, source_date)
+              VALUES (?, ?, ?, ?, ?, vector(?), ?, ?, ?)`,
+        args: [
+          id,
+          section.file,
+          section.heading,
+          content,
+          hash,
+          vecJson,
+          now,
+          section.ref ? 'ref' : 'law',
+          current.get(id)!.sourceDate,
+        ],
       });
     }
   }

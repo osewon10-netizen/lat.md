@@ -13,7 +13,7 @@ export function formatSectionId(id: string, s: Styler): string {
 export function formatSectionPreview(
   ctx: CmdContext,
   section: Section,
-  opts?: { reason?: string },
+  opts?: { reason?: string; sourceDate?: string | null },
 ): string {
   const s = ctx.styler;
   const relPath = relative(
@@ -23,9 +23,16 @@ export function formatSectionPreview(
 
   const kind = section.id.includes('#') ? 'Section' : 'File';
   const reasonSuffix = opts?.reason ? ' ' + s.dim(`(${opts.reason})`) : '';
+  // Reference hits are tagged at the point of reading, not in a footnote — the
+  // tag and the date together are what let a reader judge currency on contact.
+  const tier = section.ref ? s.yellow('[ref] ') : '';
+  const dated =
+    section.ref && opts?.sourceDate
+      ? s.dim(` · last change ${opts.sourceDate}`)
+      : '';
   const lines: string[] = [
-    `${s.dim('*')} ${s.dim(kind + ':')} [[${formatSectionId(section.id, s)}]]${reasonSuffix}`,
-    `  ${s.dim('Defined in')} ${s.cyan(relPath)}${s.dim(`:${section.startLine}-${section.endLine}`)}`,
+    `${s.dim('*')} ${tier}${s.dim(kind + ':')} [[${formatSectionId(section.id, s)}]]${reasonSuffix}`,
+    `  ${s.dim('Defined in')} ${s.cyan(relPath)}${s.dim(`:${section.startLine}-${section.endLine}`)}${dated}`,
   ];
 
   if (section.firstParagraph) {
@@ -47,12 +54,34 @@ export function formatResultList(
     lines.push(
       formatSectionPreview(ctx, matches[i].section, {
         reason: matches[i].reason,
+        sourceDate: matches[i].sourceDate,
       }),
     );
   }
 
+  if (matches.some((m) => m.section.ref)) {
+    lines.push('', refTierNote(ctx.styler));
+  }
+
   lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * Shown whenever reference hits are present. Deliberately unflattering: the
+ * reference tier is a search convenience, and a reader who cannot feel the
+ * difference between it and `lat.md/` will eventually fold nothing and trust
+ * everything.
+ */
+export function refTierNote(s: Styler): string {
+  return (
+    s.dim('Note: ') +
+    s.yellow('[ref]') +
+    s.dim(
+      ' results are indexed reference docs, not graph-checked law — nothing' +
+        ' verifies they still match the code. Check the date before trusting one.',
+    )
+  );
 }
 
 export function formatNavHints(ctx: CmdContext): string {

@@ -25,6 +25,7 @@ Each section has:
 - `children` — nested subsections forming a tree
 - `startLine` / `endLine` — source positions in the original file
 - `firstParagraph` — first paragraph text (used by [[cli#Section Preview]])
+- `ref` — set only on sections loaded from a reference source ([[cli#search#Reference Sources]]); absent on everything from `lat.md/`. It is what separates the two index tiers downstream, so nothing in the graph — resolution, checks, folding — ever reads it
 
 [[markdown#Frontmatter]] is handled by `remark-frontmatter`, which parses it as a `yaml` AST node so heading positions reflect the original file.
 

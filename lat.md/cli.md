@@ -39,6 +39,12 @@ Usage: `lat section <query>`
 
 Core logic in [[src/cli/section.ts#getSection]] (returns structured result), used by both the CLI command and [[cli#mcp]] `lat_section` tool.
 
+### Reference sections
+
+A [[cli#search#Reference Sources]] hit is openable here too, but the lattice is consulted first, so law always wins a name collision and a reference section is reachable only when nothing in the graph matches confidently.
+
+Opening one returns items 1, 2 and 6 above and nothing else — no outgoing refs, no incoming refs, no code back-references. Those are graph traversals, and a reference source is not in the graph: rendering them empty would read as "nothing points here" rather than "this was never part of the graph". It is tagged and dated like a search hit, and carries the same [[src/format.ts#refTierNote]].
+
 ## refs
 
 Find sections that reference a given target via [[parser#Wiki Links]]. The query can be a section id or a source file path.
@@ -554,9 +560,23 @@ The database is stored at `lat.md/.cache/vectors.db` and should not be committed
 
 Implementation: [[src/search/db.ts]]
 
+### Reference Sources
+
+The index has two tiers. `lat.md/` is **law**. A markdown file anywhere else in the repo joins as a **reference source** by marking itself with [[markdown#Frontmatter#ref]]; [[src/lattice.ts#loadRefSections]] walks the project root (through [[src/walk.ts#walkEntries]], so `.gitignore` applies) and loads only marked files.
+
+Reference sections are searchable and openable with [[cli#section]]. They are **not** in the graph: [[cli#check]] never scans them, a `[[wiki link]]` cannot resolve to one, they can never be a fold target, and [[cli#section]] on one returns content with no ref traversal at all — structurally empty outgoing/incoming/code refs would read as "nothing points here" rather than "this was never in the graph".
+
+Admission is **authored, per file, not configured**. A glob over `docs/` cannot separate live reference material from shipped-item specs and archived plans, and the index cannot tell them apart once they are in. Requiring an explicit marker puts that judgment on whoever last read the file, and leaves everything unmarked invisible — which is what the archive should be.
+
+The marker admits, but it does not decay: it is a one-shot act, and the doc goes stale afterwards while the marker stays. So every reference hit is presented with two things law never needs — a `[ref]` tag and the date of the file's last content change ([[src/git.ts#lastCommitDate]], stored per row at index time). Together they let a reader judge currency on contact, against the lat.md sections the hit sits beside. The tier note in [[src/format.ts#refTierNote]] is deliberately unflattering for the same reason: a reader who cannot feel the difference between the tiers will eventually fold nothing and trust everything.
+
+Removing the marker evicts the file's sections on the next index — the marker is the only thing holding it in.
+
 ### Indexing
 
-Sections are extracted via `loadAllSections()` + `flattenSections()`. For each section, the raw markdown between `startLine` and `endLine` is read (not just `firstParagraph`) for richer semantic signal.
+Sections come from `loadAllSections()` + `flattenSections()`, plus `loadRefSections()` for the reference tier ([[cli#search#Reference Sources]]). Each section's raw markdown between `startLine` and `endLine` is read — not just `firstParagraph` — for richer semantic signal.
+
+Each row records its tier in `kind` (`law` / `ref`) and, for reference rows, `source_date`. Both columns are added to a pre-existing `sections` table by `ALTER TABLE` rather than forcing a re-embed: the vectors are unaffected by the tier split, and `law` is the correct default for every row already there.
 
 Content freshness is tracked via SHA-256 hashes. On each run:
 
@@ -604,12 +624,15 @@ Implementation: [[src/cli/reindex.ts#reindexCommand]]
 
 Shared output format used by [[cli#locate]], [[cli#refs]], and [[cli#search]]. Each section is rendered as a bullet (`*`) with:
 
-1. Kind label (`File:` or `Section:`) — file root sections vs subsections
-2. Section id in `[[wiki link]]` syntax (path segments dimmed, final segment bold)
-3. Match reason in parentheses (e.g. `(exact match)`, `(section name match)`, `(fuzzy match, distance 2)`)
-4. "Defined in" label with file path (cyan) and line range
-5. Body text quoted with `>` (first paragraph, guaranteed ≤250 chars by [[cli#check#sections]])
+1. `[ref]` tier tag — present only on a [[cli#search#Reference Sources]] hit, absent on law
+2. Kind label (`File:` or `Section:`) — file root sections vs subsections
+3. Section id in `[[wiki link]]` syntax (path segments dimmed, final segment bold)
+4. Match reason in parentheses (e.g. `(exact match)`, `(section name match)`, `(fuzzy match, distance 2)`)
+5. "Defined in" label with file path (cyan) and line range, plus `· last change <date>` on a reference hit
+6. Body text quoted with `>` (first paragraph, guaranteed ≤250 chars by [[cli#check#sections]])
 
-Commands that return multiple results use `formatResultList()` which adds a markdown `##` heading and consistent spacing.
+Commands that return multiple results use `formatResultList()` which adds a markdown `##` heading and consistent spacing. When any result is a reference hit it also appends [[src/format.ts#refTierNote]] once, below the list.
+
+Only [[cli#search]] can surface a reference hit — [[cli#locate]] and [[cli#refs]] read the graph, which has no reference sections in it, so the tag and date never appear there.
 
 Implementation: [[src/format.ts]] — exports [[src/format.ts#formatSectionId]], [[src/format.ts#formatSectionPreview]], [[src/format.ts#formatResultList]], and [[src/format.ts#formatNavHints]]

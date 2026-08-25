@@ -55,9 +55,24 @@ export async function ensureSectionsSchema(
       content TEXT NOT NULL,
       content_hash TEXT NOT NULL,
       embedding F32_BLOB(${dimensions}),
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'law',
+      source_date TEXT
     )`,
   );
+  // Caches built before reference sources existed have neither column. The
+  // vectors themselves are still valid, so migrate in place rather than forcing
+  // a full re-embed: 'law' is the correct default for every row already there.
+  for (const ddl of [
+    "ALTER TABLE sections ADD COLUMN kind TEXT NOT NULL DEFAULT 'law'",
+    'ALTER TABLE sections ADD COLUMN source_date TEXT',
+  ]) {
+    try {
+      await db.execute(ddl);
+    } catch {
+      // Column already present — the CREATE above supplied it.
+    }
+  }
   await db.execute(
     `CREATE INDEX IF NOT EXISTS sections_vec_idx
      ON sections (libsql_vector_idx(embedding))`,

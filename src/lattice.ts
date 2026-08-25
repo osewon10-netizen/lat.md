@@ -18,6 +18,12 @@ export type Section = {
   startLine: number;
   endLine: number;
   firstParagraph: string;
+  /**
+   * Set on sections that came from a reference source outside `lat.md/` (see
+   * `loadRefSections`). Reference sections are searchable but are not law:
+   * they never participate in graph checks, wiki-link resolution, or folding.
+   */
+  ref?: boolean;
 };
 
 export type Ref = {
@@ -29,7 +35,30 @@ export type Ref = {
 
 export type LatFrontmatter = {
   requireCodeMention?: boolean;
+  /** `lat: { ref: true }` — admits the file to the index as a reference source. */
+  ref?: boolean;
 };
+
+/**
+ * Read the block nested under a top-level `lat:` key, or '' when absent.
+ *
+ * The `ref` marker is scoped this way rather than pattern-matched across the
+ * whole document because reference sources are ordinary repo files: unlike a
+ * `lat.md/` file, their frontmatter belongs to other tooling too, and a loose
+ * match on a bare `ref:` would silently admit a doc that never opted in.
+ */
+function latBlock(yaml: string): string {
+  const lines = yaml.split('\n');
+  const start = lines.findIndex((l) => /^lat:\s*$/.test(l));
+  if (start === -1) return '';
+  const block: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === '') continue;
+    if (!/^\s/.test(line)) break; // dedent — the lat block ended
+    block.push(line);
+  }
+  return block.join('\n');
+}
 
 export function parseFrontmatter(content: string): LatFrontmatter {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
@@ -38,6 +67,9 @@ export function parseFrontmatter(content: string): LatFrontmatter {
   const result: LatFrontmatter = {};
   if (/require-code-mention:\s*true/i.test(yaml)) {
     result.requireCodeMention = true;
+  }
+  if (/^\s+ref:\s*true\s*$/im.test(latBlock(yaml))) {
+    result.ref = true;
   }
   return result;
 }
@@ -197,6 +229,72 @@ export async function loadAllSections(latticeDir: string): Promise<Section[]> {
     all.push(...parseSections(file, content, projectRoot));
   }
   return all;
+}
+
+/**
+ * Load sections from *reference sources* — markdown files outside `lat.md/`
+ * that opt into the search index with `ref: true` under their `lat:`
+ * frontmatter block.
+ *
+ * Admission is per-file and authored, not configured: a glob over `docs/` would
+ * sweep in shipped-item specs and archived plans alongside live reference
+ * material, and the index cannot tell them apart. Requiring the author to mark
+ * the file puts the judgment on whoever just read it, and leaves everything
+ * unmarked — the archive — invisible, exactly as it is today.
+ *
+ * What comes back is searchable, never law. Reference sections are absent from
+ * `loadAllSections`, so `lat check`, wiki-link resolution, and folding never see
+ * them: they cannot be a link target, cannot satisfy a ref, and cannot be
+ * folded into.
+ */
+export async function loadRefSections(projectRoot: string): Promise<Section[]> {
+  const entries = await walkEntries(projectRoot);
+  const all: Section[] = [];
+
+  for (const entry of entries) {
+    const rel = toPosix(entry);
+    if (!rel.endsWith('.md')) continue;
+    // `lat.md/` is law, loaded by loadAllSections — never a reference source.
+    if (rel === 'lat.md' || rel.startsWith('lat.md/')) continue;
+
+    const absPath = join(projectRoot, entry);
+    let content: string;
+    try {
+      content = await readFile(absPath, 'utf-8');
+    } catch {
+      continue; // unreadable (races with a delete, permissions) — skip
+    }
+    if (!parseFrontmatter(content).ref) continue;
+
+    let sections = parseSections(absPath, content, projectRoot);
+    // A marked file with no headings would otherwise index as nothing — a
+    // silent no-op for someone who explicitly opted in. Give it one section
+    // spanning the whole file so the marker always means something.
+    if (sections.length === 0) {
+      sections = [wholeFileSection(rel, content)];
+    }
+    for (const s of flattenSections(sections)) s.ref = true;
+    all.push(...sections);
+  }
+
+  return all;
+}
+
+/** Synthesize a single section covering a heading-less reference file. */
+function wholeFileSection(rel: string, content: string): Section {
+  const file = rel.replace(/\.md$/, '');
+  const heading = basename(file);
+  return {
+    id: file,
+    heading,
+    depth: 1,
+    file,
+    filePath: rel,
+    children: [],
+    startLine: 1,
+    endLine: lastLine(content),
+    firstParagraph: '',
+  };
 }
 
 export function flattenSections(sections: Section[]): Section[] {
@@ -377,6 +475,8 @@ const MAX_DISTANCE_RATIO = 0.4;
 export type SectionMatch = {
   section: Section;
   reason: string;
+  /** Last content change of a reference source, when the match is one. */
+  sourceDate?: string | null;
 };
 
 export function findSections(

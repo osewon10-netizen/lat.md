@@ -18,8 +18,10 @@ import {
 } from '../search/embedder.js';
 import { indexSections, type IndexStats } from '../search/index.js';
 import { searchSections } from '../search/search.js';
+import { dirname } from 'node:path';
 import {
   loadAllSections,
+  loadRefSections,
   flattenSections,
   type SectionMatch,
 } from '../lattice.js';
@@ -107,21 +109,43 @@ async function withDb<T>(
   }
 }
 
-/** Resolve raw search hits (by id) to full section matches. */
+/**
+ * Resolve raw search hits (by id) to full section matches.
+ *
+ * Hits span both tiers, so reference sources are loaded alongside `lat.md/`
+ * here — a ref id has no entry in the lattice and would otherwise be dropped
+ * silently. Loading them is search-side only; the graph never sees them.
+ */
 async function resolveMatches(
   latDir: string,
-  results: { id: string }[],
+  results: { id: string; sourceDate?: string | null }[],
 ): Promise<SectionMatch[]> {
   if (results.length === 0) return [];
 
-  const allSections = await loadAllSections(latDir);
-  const flat = flattenSections(allSections);
+  const flat = flattenSections(await loadAllSections(latDir));
   const byId = new Map(flat.map((s) => [s.id, s]));
 
+  // Only pay the repo walk when a hit actually needs it.
+  if (results.some((r) => !byId.has(r.id))) {
+    const refs = flattenSections(await loadRefSections(dirname(latDir)));
+    for (const s of refs) if (!byId.has(s.id)) byId.set(s.id, s);
+  }
+
   return results
-    .map((r) => byId.get(r.id))
-    .filter((s): s is NonNullable<typeof s> => !!s)
-    .map((s) => ({ section: s, reason: 'semantic match' }));
+    .map((r) => ({ section: byId.get(r.id), sourceDate: r.sourceDate ?? null }))
+    .filter(
+      (
+        m,
+      ): m is {
+        section: NonNullable<typeof m.section>;
+        sourceDate: string | null;
+      } => !!m.section,
+    )
+    .map((m) => ({
+      section: m.section,
+      reason: 'semantic match',
+      sourceDate: m.sourceDate,
+    }));
 }
 
 /**

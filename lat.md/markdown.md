@@ -82,3 +82,11 @@ lat:
 ### require-code-mention
 
 When set to `true`, [[cli#check#code-refs]] ensures every leaf section (sections with no children) in the file has a corresponding `// @lat: [[...]]` reference in source code. Useful for test specs and requirements that must be traceable to implementation.
+
+### ref
+
+When set to `true` on a markdown file **outside** `lat.md/`, that file is indexed as a reference source — searchable, never law. See [[cli#search#Reference Sources]] for what the tier does and does not get.
+
+The marker is read by [[src/lattice.ts#parseFrontmatter]], but only inside the `lat:` block: unlike a `lat.md/` file, a reference source is an ordinary repo document whose frontmatter is shared with other tooling, so a bare top-level `ref:` is ignored rather than treated as an opt-in.
+
+Setting it inside `lat.md/` does nothing — those files are already law.

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, rmSync, cpSync } from 'node:fs';
+import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { rmDirBestEffort } from './util.js';
 import { tmpdir } from 'node:os';
@@ -240,5 +240,104 @@ describe.skipIf(!canRunHosted)('search (rag, hosted replay)', () => {
       embedder,
     );
     expect(results[0].id).toContain('Authentication');
+  });
+});
+
+// --- Reference sources: the second index tier ---
+//
+// A `lat.ref` file is searchable but is not law. These cover the seam: it
+// reaches the index, it carries the tier and the date that let a reader judge
+// currency, and an unmarked sibling stays out.
+
+// @lat: [[search#Reference Sources]]
+describe('search (reference sources, local)', () => {
+  let latDir: string;
+  let projectRoot: string;
+  let db: Client;
+  let embedder: Embedder;
+
+  beforeAll(async () => {
+    embedder = await createEmbedder({ model: minilm });
+    latDir = copyFixture();
+    projectRoot = join(latDir, '..');
+    mkdirSync(join(projectRoot, 'specs'), { recursive: true });
+    writeFileSync(
+      join(projectRoot, 'specs', 'market.md'),
+      '---\nlat:\n  ref: true\n---\n\n# Market Semantics\n\n' +
+        '## Session Boundaries\n\n' +
+        "A trading session opens at 09:30 and closes at 16:00 in the venue's" +
+        ' local timezone.\n',
+    );
+    // Unmarked sibling — the archive case that a docs/ glob would have swept in.
+    writeFileSync(
+      join(projectRoot, 'specs', 'shipped.md'),
+      '# PA-983 Depth Gate\n\nRewritten to sample five book levels. Shipped.\n',
+    );
+    db = openDb(latDir);
+    await ensureMeta(db);
+    await ensureSectionsSchema(db, embedder.dimensions);
+    await indexSections(latDir, db, embedder);
+  });
+
+  afterAll(async () => {
+    if (db) await closeDb(db);
+    if (projectRoot) rmDirBestEffort(projectRoot);
+  });
+
+  // @lat: [[search#Reference Sources#Indexes a marked file on the ref tier]]
+  it('indexes a marked file and tags the rows as ref', async () => {
+    const rows = await db.execute(
+      "SELECT id FROM sections WHERE kind = 'ref' ORDER BY id",
+    );
+    const ids = rows.rows.map((r) => r.id as string);
+    expect(ids).toContain('specs/market#Market Semantics#Session Boundaries');
+    expect(ids.every((id) => id.startsWith('specs/market'))).toBe(true);
+  });
+
+  // @lat: [[search#Reference Sources#Leaves an unmarked file out entirely]]
+  it('leaves an unmarked file out of the index entirely', async () => {
+    const rows = await db.execute(
+      "SELECT COUNT(*) AS n FROM sections WHERE file LIKE 'specs/shipped%'",
+    );
+    expect(rows.rows[0].n).toBe(0);
+  });
+
+  // @lat: [[search#Reference Sources#Keeps lat.md/ sections on the law tier]]
+  it('keeps lat.md/ sections on the law tier', async () => {
+    const rows = await db.execute(
+      "SELECT COUNT(*) AS n FROM sections WHERE kind = 'law'",
+    );
+    expect(rows.rows[0].n).toBe(9);
+  });
+
+  // @lat: [[search#Reference Sources#Returns the tier and date on a hit]]
+  it('returns the tier and date on a hit', async () => {
+    const results = await searchSections(
+      db,
+      'when does a trading session open and close?',
+      embedder,
+    );
+    const hit = results.find((r) => r.id.startsWith('specs/market'));
+    expect(hit).toBeDefined();
+    expect(hit!.kind).toBe('ref');
+    // The fixture is not a git repo, so there is no commit to date it by —
+    // the column is nullable precisely so an unversioned tree still indexes.
+    expect(hit!.sourceDate).toBeNull();
+  });
+
+  // The marker is the only thing holding a file in the index; dropping it must
+  // evict, or an unmarked doc would linger with search authority it lost.
+  // @lat: [[search#Reference Sources#Evicts a file whose marker is removed]]
+  it('evicts a file whose marker is removed', async () => {
+    writeFileSync(
+      join(projectRoot, 'specs', 'market.md'),
+      '# Market Semantics\n\n## Session Boundaries\n\nUnmarked now.\n',
+    );
+    const stats = await indexSections(latDir, db, embedder);
+    expect(stats.removed).toBe(2); // root + Session Boundaries
+    const rows = await db.execute(
+      "SELECT COUNT(*) AS n FROM sections WHERE kind = 'ref'",
+    );
+    expect(rows.rows[0].n).toBe(0);
   });
 });
